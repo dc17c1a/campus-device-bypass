@@ -1,0 +1,38 @@
+# 出口指纹整理（受管网段流量出 br-lan 前统一）。这是"绕过多设备检测"的
+# 网络层基本功，原理与检测手段的对应关系见 docs/detection-and-countermeasures.md。
+#
+#   - TTL 统一为 64：校园侧 TTL 统计是最普遍、最便宜的检测（Windows 128 /
+#     Linux·Android·iOS 64，经过一级 NAT 变 127/63）。统一后出口只呈现一种初值。
+#   - 原子包 IPID 置 0：Windows 的 IPv4 ID 是全局递增计数器，同 IP 出现多条
+#     递增轨迹即判多台 Windows；Linux/macOS 本来多为 0，统一置 0 即可。
+#     分片包（frag-off & 0x3fff != 0）放过，保证重组不受影响。
+#   - mark 0xc91 是 ua3f desync 注入包的标记（TTL 故意为 1，不参与统一），
+#     只把它们的 IPID 归零。
+#   - ICMP 伪装：校园侧看到的是路由器自身 ping，而不是 NAT 后的多台设备。
+#   - IPv6 对受管网段全 drop：只留 v4 一条栈，避免双栈直通绕过代理链与
+#     DNS 收敛（与 dnsmasq 的 filter_aaaa=1 配套）。
+#   - UDP 443 reject：QUIC 无法被代理链完整接管，直接拒绝逼客户端回落 TCP。
+#
+# 前置条件：关闭 flow offloading / TurboACC / 硬件加速，否则 mangle hook 被
+# fast-path 跳过，本文件全部失效（`uci set firewall.@defaults[0].flow_offloading=0`）。
+chain iot_mangle_post {
+	type filter hook postrouting priority mangle; policy accept;
+	ip saddr 192.168.2.0/24 meta mark != 0x00000c91 oifname "br-lan" counter ip ttl set 64 comment "ttl64-iot-only"
+	ip saddr 192.168.2.0/24 oifname "br-lan" ip frag-off & 0x3fff == 0 ip id != 0 counter ip id set 0 comment "all-ipid-zero-iot"
+	meta mark 0x00000c91 oifname "br-lan" ip frag-off & 0x3fff == 0 ip id != 0 counter ip id set 0 comment "inject-ipid-zero"
+}
+
+chain iot_icmp_masq {
+	type nat hook postrouting priority srcnat; policy accept;
+	ip saddr 192.168.2.0/24 oifname "br-lan" ip protocol icmp counter masquerade comment "icmp-masq"
+}
+
+chain iot_v6drop {
+	type filter hook forward priority filter; policy accept;
+	iifname "br-iot" meta nfproto ipv6 counter drop comment "v6drop-iot-only"
+}
+
+chain iot_quic_block {
+	type filter hook forward priority filter; policy accept;
+	ip saddr 192.168.2.0/24 oifname "br-lan" udp dport 443 counter reject comment "quic-block-iot"
+}

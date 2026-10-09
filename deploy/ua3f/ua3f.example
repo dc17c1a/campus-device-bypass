@@ -1,0 +1,36 @@
+# UA3F 示例配置（/etc/config/ua3f）
+#
+# UA3F 是第三方开源项目：https://github.com/SunBK201/UA3F
+# 本文件只是"被本项目用到"的配置示例，安装方式见上游文档。
+#
+# 在本方案里的两个作用：
+#   a) 作为 SOCKS5 上游（sing-box 的 via-ua3f 出口）：把明文 HTTP 的 UA 统一
+#      改写为一个常见、真实的值，抹掉 OS/浏览器/App 差异（校园网最便宜的检测
+#      维度之一就是 UA）；同时做 L3 指纹整理（TCP 时间戳/窗口等）。
+#   b) 配合 nft NFQUEUE 钩子（把全部 TCP SYN 交给 ua3f）做连接级指纹整理。
+# 伪装值务必与你的 TLS 指纹/实际客户端形态一致：UA 声称 Chrome 而指纹是 Go
+# 等于自爆（选一个主流值，不要用带 App 尾巴的稀有串）。
+config ua3f 'enabled'
+	option enabled '1'
+
+config ua3f 'main'
+	option server_mode 'SOCKS5'
+	option bind '127.0.0.1'
+	option port '18081'
+	option rewrite_mode 'GLOBAL'
+	option ua 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) +CoolMarket/15.1.0-2502241-universal'
+	option log_level 'WARN'
+	option log_lines '1000'
+	option header_rewrite '[{"enabled":true,"type":"DEST-PORT","action":"DIRECT","match_value":"443"},{"enabled":true,"type":"HEADER-KEYWORD","action":"REPLACE","match_value":"Mac","match_header":"User-Agent","rewrite_header":"User-Agent","rewrite_value":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) +CoolMarket/15.1.0-2502241-universal"},{"enabled":true,"type":"HEADER-REGEX","action":"REPLACE","match_value":"(Apple|iPhone|iPad|Macintosh|Mac OS X|Mac|Darwin|Microsoft|Windows|Linux|Android|OpenHarmony|HUAWEI|OPPO|Vivo|XiaoMi|Mobile|Dalvik)","match_header":"User-Agent","rewrite_header":"User-Agent","rewrite_value":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) +CoolMarket/15.1.0-2502241-universal"},{"enabled":true,"type":"FINAL","action":"REPLACE","rewrite_value":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) +CoolMarket/15.1.0-2502241-universal","rewrite_header":"User-Agent","description":"Default Fallback Rule"}]'
+	option l3_rewrite_ttl '1'
+	option l3_rewrite_tcpts '1'
+	option l3_rewrite_tcpwin '1'
+	option l3_rewrite_ipid '0'
+	option l3_rewrite_bpf_offload '0'
+	option l3_rewrite_block_quic '0'
+	option mitm_enabled '0'
+	option desync_reorder '1'
+	option desync_inject '1'
+	option desync_reorder_bytes '2000'
+	option desync_reorder_packets '8'
+	option desync_inject_ttl '1'

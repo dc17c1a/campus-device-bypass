@@ -1,0 +1,9 @@
+# 构建产物
+gate/wxdet-gate
+gate/wxdet-gate-arm64
+
+# 杂项
+.DS_Store
+__pycache__/
+*.pyc
+*.exe

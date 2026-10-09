@@ -1,0 +1,25 @@
+# TCP 前置分流：受管网段所有 TCP（除 DNS/保留端口与私网/上游网关目的）重定向进
+# wxdet-gate（deploy/init.d/wxdet-gate）。
+#
+#   - 53 留给 DNS 劫持链（33-dns-ntp.nft）；1080 是 ua3f 的 REDIRECT 保留口；
+#   - 目的为上游网关（示例 192.168.71.1）的流量直放，避免把本机与上游的
+#     管理/认证流量卷进门；
+#   - 私网目的直放：内网互访、本机服务不进隧道。
+#
+# 部署：放入 /etc/nftables.d/ 后 fw4 会在 `inet fw4` 表上下文 include。
+# 生效建议：`nft -f` 加载本文件 + `nft list chain inet fw4 iot_redir` 确认，
+# 而不是 `fw4 reload`（reload 会清零计数器，破坏观测基线，见 deploy/nftables/README.md）。
+#
+# 网段/接口名按你的网络替换：br-iot=受管网段，192.168.2.0/24=受管网段地址，
+# 192.168.71.1=上游网关。
+chain iot_redir {
+	type nat hook prerouting priority dstnat; policy accept;
+	ip saddr 192.168.2.0/24 tcp dport != 53 tcp dport != 1080 ip daddr != 192.168.71.1 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } counter redirect to :12347 comment "tcp-to-gate"
+}
+
+# 防环/防蹭：封掉受管网段直连 ua3f REDIRECT 口的可能（本部署用 SOCKS5 实例，
+# REDIRECT 口是历史备用形态）。不是必需项，保留可多一层保险。
+chain drop1080 {
+	type filter hook prerouting priority -150; policy accept;
+	tcp dport 1080 drop comment "protect-ua3f-redirect"
+}

@@ -1,0 +1,29 @@
+# gate.kw —— gate TCP 关键词（小写子串匹配 Host / 请求行 / UA）
+# 命中即 verdict=hezi（进加密上行）。按你的实际流量增删。
+douyincdn.com
+douyinvod.com
+douyinpic.com
+douyinstatic.com
+douyin.com
+pstatp.com
+snssdk.com
+bytefcdn.com
+byteimg.com
+bytedance.com
+bytednsdoc.com
+amemv.com
+ixigua.com
+toutiaovod.com
+toutiaostatic.com
+toutiao.com
+mmbiz.qpic.cn
+qpic.cn
+gtimg.cn
+qlogo.cn
+qq.com
+mmtls
+com.ss.android.ugc.aweme
+micromessenger
+micromsg-bin
+mmpay-bin
+tlivesource.com

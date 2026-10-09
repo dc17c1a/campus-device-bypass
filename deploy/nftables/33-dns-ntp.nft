@@ -1,0 +1,30 @@
+# DNS / NTP 收敛（受管网段）：
+#
+#   - 明文 DNS（TCP/UDP 53）强制重定向到本机 dnsmasq；dnsmasq 的上游不是
+#     校园网的 53，而是本机 https-dns-proxy（DoH），避免明文查询暴露设备画像与域名。
+#   - DoT（TCP 853）直接 reject：逼客户端回到受控 DNS，不给"加密 DNS 直连"
+#     留旁路（DoH 域名/IP 另由 gate 与 sing-box 的 block 名单封堵）。
+#   - NTP（UDP 123）重定向到本机：不同设备各自的 NTP 域名/周期也是弱画像信号，
+#     统一到本机后出口只剩路由器一种时钟行为。
+#
+# 配套（dnsmasq 关键项，示例命令）：
+#   uci set dhcp.@dnsmasq[0].filter_aaaa=1        # 禁 AAAA，逼 v4 单栈
+#   uci set dhcp.@dnsmasq[0].min_cache_ttl=3600
+#   uci set dhcp.@dnsmasq[0].rebind_protection=0
+#   uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#5053'   # https-dns-proxy
+#   uci set system.ntp.enable_server=1             # 本机成为 NTP 应答方
+chain dns_force_dnat {
+	type nat hook prerouting priority dstnat; policy accept;
+	ip saddr 192.168.2.0/24 tcp dport 53 counter redirect to :53 comment "DNS-TCP-HIJACK-iot"
+	ip saddr 192.168.2.0/24 udp dport 53 counter redirect to :53 comment "DNS-UDP-HIJACK-iot"
+}
+
+chain dns_force_fwd {
+	type filter hook forward priority -1; policy accept;
+	ip saddr 192.168.2.0/24 tcp dport 853 counter reject comment "BLOCK-DOT-iot"
+}
+
+chain iot_ntp_hijack {
+	type nat hook prerouting priority dstnat; policy accept;
+	ip saddr 192.168.2.0/24 udp dport 123 ip daddr != { 127.0.0.0/8, 192.168.0.0/16, 224.0.0.0/4 } counter redirect to :123 comment "ntp-hijack-iot"
+}

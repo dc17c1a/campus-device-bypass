@@ -1,0 +1,24 @@
+# dl-domains.txt —— 下载站 Host 名单（精确/子域匹配，30s 热加载）
+# 命中记 xray/dl_direct：下载/更新流量走代理出口（统一指纹）而不是进隧道，
+# 兼顾速度与链路特征。
+down.qq.com
+down-update.qq.com
+wegame.gtimg.com
+down.anticheatexpert.com
+ctldl.windowsupdate.com
+download.windowsupdate.com
+# 微软更新/下载域按父域收（telemetry/登录域除外）
+update.microsoft.com
+windowsupdate.microsoft.com
+officecdn.microsoft.com
+download.microsoft.com
+emdl.ws.microsoft.com
+mp.microsoft.com
+# 微软 DO / Steam CDN（动态前缀子域，靠子域匹配覆盖）
+dl.delivery.mp.microsoft.com
+st.dl.eccdnx.com
+dl.steam.clngaa.com
+gstore.val.smogfly.com
+xz.pphimalayanrt.com
+# QQ CDN 仓库下载（GET /rid.*；注意 qq.com 在 gate.kw 里会误杀，需精确 Host）
+repo.nzm.qq.com

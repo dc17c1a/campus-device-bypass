@@ -1,0 +1,17 @@
+# dl-ext.txt —— 二进制/媒体 URL 后缀（小写，不带点，30s 热加载）
+# 只收二进制/媒体，不收 json/js/css，避免影响正常浏览。命中记 xray/dl_ext。
+apk
+exe
+msi
+dmg
+iso
+zip
+rar
+7z
+tar.gz
+mp4
+flv
+ts
+m3u8
+mp3
+pdf

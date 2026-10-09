@@ -1,5 +1,5 @@
 # dl-ua.txt —— 下载器 UA token（小写子串匹配，30s 热加载）
-# 命中记 xray/dl_ua。用于 Host 为 IP 字面/无域名可匹配的下载器流量。
+# 命中记 pass/dl_ua。用于 Host 为 IP 字面/无域名可匹配的下载器流量。
 Thunder
 QQDownload
 IDM

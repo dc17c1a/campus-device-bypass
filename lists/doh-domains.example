@@ -1,5 +1,5 @@
 # doh-domains.txt —— 加密 DNS（DoH/DoT）域名名单（精确/子域匹配）
-# 命中 verdict=block/dns_block；sing-box 路由里还有一份同源的 block 规则。
+# 命中 verdict=block/dns_block；下游代理路由里还有一份同源的 block 规则。
 # 本文件是样例；生产建议用上游全量（示例 40 条）：
 #   https://github.com/dibdot/DoH-IP-blocklists
 #   https://github.com/Sekhan/TheGreatWall

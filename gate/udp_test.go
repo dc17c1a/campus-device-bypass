@@ -24,10 +24,10 @@ func TestClassifyUDP(t *testing.T) {
 		in   []byte
 		v, r string
 	}{
-		{"std-req", stdReq, "hezi", "stun_udp"},
-		{"std-resp", stdResp, "hezi", "stun_udp"},
-		{"var-req", varReq, "hezi", "stun_udp_var"},
-		{"var-resp", varResp, "hezi", "stun_udp_var"},
+		{"std-req", stdReq, "proxy", "stun_udp"},
+		{"std-resp", stdResp, "proxy", "stun_udp"},
+		{"var-req", varReq, "proxy", "stun_udp_var"},
+		{"var-resp", varResp, "proxy", "stun_udp_var"},
 		{"obf-3478", obf, "direct", "udp_direct"},
 		{"rtp", rtp, "direct", "udp_direct"},
 		{"short", []byte{0x00, 0x01, 0x02}, "direct", "udp_short"},
@@ -118,16 +118,16 @@ func TestUDPVerdictPort80(t *testing.T) {
 	obf, _ := hex.DecodeString("3bcaac48c3eeefe893a6bcb5d39e90939eb4b3d1")
 	rtp := bytes.Repeat([]byte{0x80}, 40)
 	od80 := dstAddr{ip: net.ParseIP("8.8.8.8"), port: 80}
-	// UDP 80 承接：任何载荷恒 hezi/port80_udp（不看 STUN 形状）。
+	// UDP 80 承接：任何载荷恒 proxy/port80_udp（不看 STUN 形状）。
 	for _, p := range [][]byte{stdReq, obf, rtp, {0x00, 0x01, 0x02}, nil, {}} {
-		if v, r := udpVerdict(od80, p); v != "hezi" || r != "port80_udp" {
-			t.Errorf("port80 len=%d: got %s/%s want hezi/port80_udp", len(p), v, r)
+		if v, r := udpVerdict(od80, p); v != "proxy" || r != "port80_udp" {
+			t.Errorf("port80 len=%d: got %s/%s want proxy/port80_udp", len(p), v, r)
 		}
 	}
 	// 非 80 透传 classifyUDP。
 	od443 := dstAddr{ip: net.ParseIP("8.8.8.8"), port: 443}
-	if v, r := udpVerdict(od443, stdReq); v != "hezi" || r != "stun_udp" {
-		t.Errorf("443 stun: got %s/%s want hezi/stun_udp", v, r)
+	if v, r := udpVerdict(od443, stdReq); v != "proxy" || r != "stun_udp" {
+		t.Errorf("443 stun: got %s/%s want proxy/stun_udp", v, r)
 	}
 	if v, r := udpVerdict(od443, obf); v != "direct" || r != "udp_direct" {
 		t.Errorf("443 obf: got %s/%s want direct/udp_direct", v, r)
@@ -139,17 +139,17 @@ func TestUDPVerdictPort8000Range(t *testing.T) {
 	stdReq := append([]byte{0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42}, txn...)
 	obf, _ := hex.DecodeString("3bcaac48c3eeefe893a6bcb5d39e90939eb4b3d1")
 	short := []byte{0x01, 0x02}
-	// 范围内：短包/混淆包翻 hezi/default，STUN 保持原归因（8080 显式锁定）。
+	// 范围内：短包/混淆包翻 proxy/default，STUN 保持原归因（8080 显式锁定）。
 	for _, port := range []int{8000, 8080, 8500, 9000} {
 		od := dstAddr{ip: net.ParseIP("1.2.3.4"), port: port}
-		if v, r := udpVerdict(od, obf); v != "hezi" || r != "default" {
-			t.Errorf("port %d obf: got %s/%s want hezi/default", port, v, r)
+		if v, r := udpVerdict(od, obf); v != "proxy" || r != "default" {
+			t.Errorf("port %d obf: got %s/%s want proxy/default", port, v, r)
 		}
-		if v, r := udpVerdict(od, short); v != "hezi" || r != "default" {
-			t.Errorf("port %d short: got %s/%s want hezi/default", port, v, r)
+		if v, r := udpVerdict(od, short); v != "proxy" || r != "default" {
+			t.Errorf("port %d short: got %s/%s want proxy/default", port, v, r)
 		}
-		if v, r := udpVerdict(od, stdReq); v != "hezi" || r != "stun_udp" {
-			t.Errorf("port %d stun: got %s/%s want hezi/stun_udp", port, v, r)
+		if v, r := udpVerdict(od, stdReq); v != "proxy" || r != "stun_udp" {
+			t.Errorf("port %d stun: got %s/%s want proxy/stun_udp", port, v, r)
 		}
 	}
 	// 范围外：行为不变。
@@ -169,19 +169,19 @@ func TestUDPVerdictCrossPortStunRelay(t *testing.T) {
 	stdReq := append([]byte{0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42}, txn...)
 	varReq := append([]byte{0x00, 0x01, 0x00, 0x08, 0x01, 0x39, 0xf4, 0x5c}, txn...)
 	obf, _ := hex.DecodeString("3bcaac48c3eeefe893a6bcb5d39e90939eb4b3d1")
-	// 跨端口 STUN（8000/1106 等非三端口）verdict==hezi 即中继，不设端口门限。
+	// 跨端口 STUN（8000/1106 等非三端口）verdict==proxy 即中继，不设端口门限。
 	for _, port := range []int{8000, 1106, 443, 12348} {
 		od := dstAddr{ip: net.ParseIP("1.2.3.4"), port: port}
-		if v, _ := udpVerdict(od, stdReq); v != "hezi" {
-			t.Errorf("port %d std stun: verdict=%s want hezi (relay)", port, v)
+		if v, _ := udpVerdict(od, stdReq); v != "proxy" {
+			t.Errorf("port %d std stun: verdict=%s want proxy (relay)", port, v)
 		}
-		if v, _ := udpVerdict(od, varReq); v != "hezi" {
-			t.Errorf("port %d var stun: verdict=%s want hezi (relay)", port, v)
+		if v, _ := udpVerdict(od, varReq); v != "proxy" {
+			t.Errorf("port %d var stun: verdict=%s want proxy (relay)", port, v)
 		}
-		// 8000-9000 兜底：非 STUN 残渣翻 hezi/default，范围外仍 direct。
+		// 8000-9000 兜底：非 STUN 残渣翻 proxy/default，范围外仍 direct。
 		if port >= 8000 && port <= 9000 {
-			if v, r := udpVerdict(od, obf); v != "hezi" || r != "default" {
-				t.Errorf("port %d obf: got %s/%s want hezi/default", port, v, r)
+			if v, r := udpVerdict(od, obf); v != "proxy" || r != "default" {
+				t.Errorf("port %d obf: got %s/%s want proxy/default", port, v, r)
 			}
 			continue
 		}
@@ -189,21 +189,21 @@ func TestUDPVerdictCrossPortStunRelay(t *testing.T) {
 			t.Errorf("port %d obf: verdict=%s want direct", port, v)
 		}
 	}
-	// 三端口 STUN 仍 hezi（行为不变）。
+	// 三端口 STUN 仍 proxy（行为不变）。
 	for _, port := range []int{3478, 5349, 19302} {
 		od := dstAddr{ip: net.ParseIP("1.2.3.4"), port: port}
-		if v, _ := udpVerdict(od, stdReq); v != "hezi" {
-			t.Errorf("port %d std stun: verdict=%s want hezi", port, v)
+		if v, _ := udpVerdict(od, stdReq); v != "proxy" {
+			t.Errorf("port %d std stun: verdict=%s want proxy", port, v)
 		}
 	}
 }
 
-// 注：中继不设端口门限，verdict==hezi 即中继；中继语义由下述 fail-closed 回归用例覆盖。
+// 注：中继不设端口门限，verdict==proxy 即中继；中继语义由下述 fail-closed 回归用例覆盖。
 
 func TestNewUDPAssocFailClosed(t *testing.T) {
-	old := heziSocks
-	heziSocks = "127.0.0.1:1" // 必关端口：assoc 必败
-	defer func() { heziSocks = old }()
+	old := proxySocks
+	proxySocks = "127.0.0.1:1" // 必关端口：assoc 必败
+	defer func() { proxySocks = old }()
 	txn := []byte{0x1d, 0xbd, 0x82, 0x61, 0xaa, 0x87, 0x29, 0x89, 0x4a, 0xac, 0x9e, 0xe1}
 	first := append([]byte{0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42}, txn...)
 	cases := []struct {
@@ -212,15 +212,15 @@ func TestNewUDPAssocFailClosed(t *testing.T) {
 		verdict string
 		reason  string
 	}{
-		{"cross-port-stun", dstAddr{ip: net.ParseIP("203.0.113.7"), port: 8000}, "hezi", "stun_udp"},
-		{"tri-port-stun", dstAddr{ip: net.ParseIP("203.0.113.7"), port: 3478}, "hezi", "stun_udp"},
-		{"udp80", dstAddr{ip: net.ParseIP("203.0.113.7"), port: 80}, "hezi", "port80_udp"},
+		{"cross-port-stun", dstAddr{ip: net.ParseIP("203.0.113.7"), port: 8000}, "proxy", "stun_udp"},
+		{"tri-port-stun", dstAddr{ip: net.ParseIP("203.0.113.7"), port: 3478}, "proxy", "stun_udp"},
+		{"udp80", dstAddr{ip: net.ParseIP("203.0.113.7"), port: 80}, "proxy", "port80_udp"},
 	}
 	for i, c := range cases {
 		client := &net.UDPAddr{IP: net.ParseIP("192.168.2.50"), Port: 40000 + i}
 		if a := newUDPAssoc(nil, client, c.od, c.verdict, c.reason, first); a != nil {
 			a.close()
-			t.Errorf("%s: hezi down must return nil (fail-closed), got assoc", c.name)
+			t.Errorf("%s: proxy down must return nil (fail-closed), got assoc", c.name)
 		}
 		udpMu.Lock()
 		_, leaked := udpTable[udpAssocKey(client, c.od)]
@@ -239,8 +239,8 @@ func TestNewUDPAssocDirectStillDials(t *testing.T) {
 	if a == nil {
 		t.Fatalf("direct assoc should dial")
 	}
-	if a.toHezi {
-		t.Errorf("direct assoc must not set toHezi")
+	if a.toProxy {
+		t.Errorf("direct assoc must not set toProxy")
 	}
 	a.close()
 }

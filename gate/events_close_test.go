@@ -13,7 +13,7 @@ func TestEventsCloseFormat(t *testing.T) {
 	p := tempEvents(t)
 	src := "192.168.2.50:40001"
 	od := dstAddr{ip: net.ParseIP("1.2.3.4"), port: 8080}
-	emitCloseEvent("tcp", src, od, "hezi", "oicq", 1234, 100, 200, "client")
+	emitCloseEvent("tcp", src, od, "proxy", "oicq", 1234, 100, 200, "client")
 	lines := readLines(t, p)
 	if len(lines) != 1 {
 		t.Fatalf("close must emit 1 line, got %d", len(lines))
@@ -23,7 +23,7 @@ func TestEventsCloseFormat(t *testing.T) {
 		t.Fatalf("close not json: %v", err)
 	}
 	if m["event"] != "close" || m["proto"] != "tcp" || m["src"] != src ||
-		m["dst"] != od.String() || m["verdict"] != "hezi" || m["reason"] != "oicq" {
+		m["dst"] != od.String() || m["verdict"] != "proxy" || m["reason"] != "oicq" {
 		t.Fatalf("close base mismatch: %v", m)
 	}
 	if int(m["dur_ms"].(float64)) != 1234 || int(m["up_B"].(float64)) != 100 ||
@@ -39,7 +39,7 @@ func TestEventsCloseLong(t *testing.T) {
 	p := tempEvents(t)
 	src := "192.168.2.50:40002"
 	od := dstAddr{ip: net.ParseIP("1.2.3.4"), port: 443}
-	emitCloseEvent("tcp", src, od, "xray", "dl_direct", 60001, 0, 0, "server")
+	emitCloseEvent("tcp", src, od, "pass", "dl_direct", 60001, 0, 0, "server")
 	lines := readLines(t, p)
 	if len(lines) != 1 {
 		t.Fatalf("long close must emit 1 line, got %d", len(lines))
@@ -55,7 +55,7 @@ func TestEventsCloseLong(t *testing.T) {
 		t.Fatalf("dur>60000 must have long=1: %v", m)
 	}
 	// 边界：60000 不加 long。
-	emitCloseEvent("tcp", src, od, "xray", "dl_direct", 60000, 0, 0, "server")
+	emitCloseEvent("tcp", src, od, "pass", "dl_direct", 60000, 0, 0, "server")
 	lines2 := readLines(t, p)
 	// p 已有 1 行 long，再加 1 行边界行，共 2 行；最后一行无 long。
 	if len(lines2) != 2 {
@@ -111,7 +111,7 @@ func TestRelayCloseBytesAndCloser(t *testing.T) {
 	start := time.Now()
 	done := make(chan struct{})
 	go func() {
-		relay(gA, gB, src, od, "hezi", "oicq", start)
+		relay(gA, gB, src, od, "proxy", "oicq", start)
 		close(done)
 	}()
 	// client->server 100B，server->client 200B，然后 client 先关写。
@@ -171,7 +171,7 @@ func TestRelayCloseBytesAndCloser(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &m); err != nil {
 		t.Fatalf("relay close not json: %v (%s)", err, lines[0])
 	}
-	if m["event"] != "close" || m["proto"] != "tcp" || m["verdict"] != "hezi" || m["reason"] != "oicq" {
+	if m["event"] != "close" || m["proto"] != "tcp" || m["verdict"] != "proxy" || m["reason"] != "oicq" {
 		t.Fatalf("relay close base: %v", m)
 	}
 	if int(m["up_B"].(float64)) != 100 || int(m["down_B"].(float64)) != 200 {
@@ -186,7 +186,7 @@ func TestEventsCloseSkipsTLS(t *testing.T) {
 	p := tempEvents(t)
 	src := "192.168.2.50:40002"
 	od := dstAddr{ip: net.ParseIP("1.2.3.4"), port: 443}
-	emitCloseEvent("tcp", src, od, "xray", "tls_direct", 5000, 1000, 2000, "client")
+	emitCloseEvent("tcp", src, od, "pass", "tls_direct", 5000, 1000, 2000, "client")
 	if lines := readLines(t, p); len(lines) != 0 {
 		t.Fatalf("tls_direct close must not enter stream, got %d lines", len(lines))
 	}

@@ -1,5 +1,5 @@
 # dl-domains.txt —— 下载站 Host 名单（精确/子域匹配，30s 热加载）
-# 命中记 xray/dl_direct：下载/更新流量走代理出口（统一指纹）而不是进隧道，
+# 命中记 pass/dl_direct：下载/更新流量转交下游入口（统一指纹）而不是判 proxy，
 # 兼顾速度与链路特征。
 down.qq.com
 down-update.qq.com

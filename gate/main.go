@@ -5,13 +5,13 @@ package main
 // nftables 把受管网段的 TCP 重定向（以及 STUN / UDP 80 / UDP 8080 的 DNAT）到本进程；
 // 本进程 peek 客户端首包，按协议指纹与明文特征把连接分成四类：
 //
-//	verdict=hezi   送加密上行（拨号 sing-box 的 gate-hezi 入站 → hezi 出口组），fail-closed
-//	verdict=xray   交给代理核心（sing-box socks 入站）按路由表选出口；命名沿用历史，非指 xray
-//	verdict=block  政策阻断（加密 DNS 等），直接断流
-//	verdict=direct 仅 UDP：直连回源（非 STUN 残渣）
+//	verdict=proxy  必须走代理：拨到下游的敏感/加密入口；失败不回退直连。
+//	verdict=pass   转交下游：拨到下游的普通入口，由下游自行决定路由。
+//	verdict=block  政策阻断（加密 DNS 等），直接断流。
+//	verdict=direct 仅 UDP：直连回源（非 STUN 残渣）。
 //
 // 设计取向：会被厂商私有协议/明文特征直接识别为“多设备”的流量，宁绕路不漏放；
-// 其余流量放行给代理核心精细分流（直连/改写/隧道），保证吞吐与体验。
+// 其余流量转交下游入口精细分流，保证吞吐与体验。gate 只做判决，不指定下游软件。
 import (
 	"encoding/binary"
 	"fmt"
@@ -30,14 +30,14 @@ import (
 
 const soOriginalDst = 80
 
-// defHeziSocks = sing-box 的 gate-hezi socks 入站；gate 判 hezi 的流量经它进
-// `hezi` 出口组（urltest），由代理核心负责多出口选择与故障转移。
-const defHeziSocks = "127.0.0.1:10811"
+// defProxySocks = 下游敏感/加密入口（SOCKS5）；gate 判 proxy 的流量经它进入下游。
+// 示例默认指向本机 127.0.0.1:10811，可用 WD_PROXY_SOCKS 覆盖为任意代理入口。
+const defProxySocks = "127.0.0.1:10811"
 
 var (
 	listenAddr  = envStr("WD_LISTEN", "0.0.0.0:12347")
-	xraySocks   = envStr("WD_XRAY_SOCKS", "127.0.0.1:10808")
-	heziSocks   = envStr("WD_HEZI_SOCKS", defHeziSocks)
+	passSocks   = envStr("WD_PASS_SOCKS", "127.0.0.1:10808")
+	proxySocks  = envStr("WD_PROXY_SOCKS", defProxySocks)
 	kwPath      = envStr("WD_KW_FILE", "/etc/wxdet/gate.kw")
 	gateLogPath = envStr("WD_LOG", "/tmp/wxdet/gate.log")
 	statsPath   = envStr("WD_STATS", "/tmp/wxdet/stats.tsv")
@@ -102,7 +102,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", listenAddr, err)
 	}
-	log.Printf("wxdet-gate listening on %s (xray=%s hezi=%s kws=%d peek=%s)", listenAddr, xraySocks, heziSocks, nkw, peekWait)
+	log.Printf("wxdet-gate listening on %s (passSocks=%s proxySocks=%s kws=%d peek=%s)", listenAddr, passSocks, proxySocks, nkw, peekWait)
 	go watchKeywords()
 	if udpListenAddr != "" && udpListenAddr != "off" {
 		go serveUDP()
@@ -166,7 +166,7 @@ func shouldPeekMore(b0 byte) bool {
 // peekClient 阻塞读客户端首包（最多 len(buf)，返回字节数；调用后清 deadline）。
 // :80 用 opportunistic 短读（peekWait80，默认 80ms）——HTTP 客户端建连即发
 // 请求，局域网内数据必在途，读到即走正常 classify（dl_direct/bsf_direct/
-// http_plain 可达）；静默/超时/空/非 HTTP 则 n=0 落 hezi/port80（fail-closed）。
+// http_plain 可达）；静默/超时/空/非 HTTP 则 n=0 落 proxy/port80（fail-closed）。
 // 443/奇端口沿用 peekWait（要载荷做 TLS/HTTP 判定，省不掉）。
 func peekClient(c net.Conn, buf []byte, port int) int {
 	wait := peekWait
@@ -195,52 +195,52 @@ func peekClient(c net.Conn, buf []byte, port int) int {
 // 误伤（如 madnson、dnspod.cn 主站、ddns 动态域名均不命中）。
 var dohSNIRe = regexp.MustCompile(`(?i)(^|\.)(dns|doh|dot)[.-]|cloudflare-dns|alidns|dns\.google|google-public-dns|doh\.pub|dot\.pub|dns\.pub|doh\.360|dot\.360|quad9|opendns|dns-over-https|securedns|one\.one\.one\.one|1dot1dot1dot1|dns64`)
 
-// hezi 端点记忆（静默复用连接收敛）：已实锤 hezi 的非 80 (ip:port)
-// 在 peek 为空时复用原 reason 判 hezi；未知端点仍 default fail-open。
-// 只记不阻：hezi 出口可达时流量照走，仅绕路不断流；TTL 12h，cap 2048。
+// proxy 端点记忆（静默复用连接收敛）：已实锤 proxy 的非 80 (ip:port)
+// 在 peek 为空时复用原 reason 判 proxy；未知端点仍 default fail-open。
+// 只记不阻：proxy 出口可达时流量照走，仅绕路不断流；TTL 12h，cap 2048。
 var (
-	heziMemMu  sync.Mutex
-	heziMem    = map[string]heziMemEnt{}
-	heziMemCap = 2048
-	heziMemTTL = int64(12 * 3600)
+	proxyMemMu  sync.Mutex
+	proxyMem    = map[string]proxyMemEnt{}
+	proxyMemCap = 2048
+	proxyMemTTL = int64(12 * 3600)
 )
 
-type heziMemEnt struct {
+type proxyMemEnt struct {
 	reason string
 	ts     int64
 }
 
-func heziMemKey(od dstAddr) string { return od.ip.String() + ":" + strconv.Itoa(od.port) }
+func proxyMemKey(od dstAddr) string { return od.ip.String() + ":" + strconv.Itoa(od.port) }
 
-func heziMemStore(od dstAddr, reason string) {
+func proxyMemStore(od dstAddr, reason string) {
 	if od.port == 80 {
 		return // :80 静默本就 port80 fail-closed，不占记忆
 	}
 	now := time.Now().Unix()
-	heziMemMu.Lock()
-	defer heziMemMu.Unlock()
-	if len(heziMem) >= heziMemCap {
-		for k, e := range heziMem {
-			if now-e.ts > heziMemTTL {
-				delete(heziMem, k)
+	proxyMemMu.Lock()
+	defer proxyMemMu.Unlock()
+	if len(proxyMem) >= proxyMemCap {
+		for k, e := range proxyMem {
+			if now-e.ts > proxyMemTTL {
+				delete(proxyMem, k)
 			}
 		}
-		if len(heziMem) >= heziMemCap {
-			heziMem = map[string]heziMemEnt{}
+		if len(proxyMem) >= proxyMemCap {
+			proxyMem = map[string]proxyMemEnt{}
 		}
 	}
-	heziMem[heziMemKey(od)] = heziMemEnt{reason: reason, ts: now}
+	proxyMem[proxyMemKey(od)] = proxyMemEnt{reason: reason, ts: now}
 }
 
-func heziMemLookup(od dstAddr) (string, bool) {
-	heziMemMu.Lock()
-	defer heziMemMu.Unlock()
-	e, ok := heziMem[heziMemKey(od)]
+func proxyMemLookup(od dstAddr) (string, bool) {
+	proxyMemMu.Lock()
+	defer proxyMemMu.Unlock()
+	e, ok := proxyMem[proxyMemKey(od)]
 	if !ok {
 		return "", false
 	}
-	if time.Now().Unix()-e.ts > heziMemTTL {
-		delete(heziMem, heziMemKey(od))
+	if time.Now().Unix()-e.ts > proxyMemTTL {
+		delete(proxyMem, proxyMemKey(od))
 		return "", false
 	}
 	return e.reason, true
@@ -386,9 +386,9 @@ func checkDohReload() bool {
 }
 
 // 下载站/下载器/BSF 名单（30s 热加载，见 lists/）：
-// dl-domains 精确/子域匹配记 xray/dl_direct；dl-ua 为 UA token 子串匹配记
-// xray/dl_ua；dl-ext 为 URL 后缀匹配记 xray/dl_ext；bsf-domains 精确/子域匹配
-// 记 xray/bsf_direct。单文件缺失保留旧快照。
+// dl-domains 精确/子域匹配记 pass/dl_direct；dl-ua 为 UA token 子串匹配记
+// pass/dl_ua；dl-ext 为 URL 后缀匹配记 pass/dl_ext；bsf-domains 精确/子域匹配
+// 记 pass/bsf_direct。单文件缺失保留旧快照。
 var (
 	dlDomPath  = envStr("WD_DL_DOM_FILE", "/etc/wxdet/dl-domains.txt")
 	dlUAPath   = envStr("WD_DL_UA_FILE", "/etc/wxdet/dl-ua.txt")
@@ -402,12 +402,12 @@ var (
 	dlMarks    = map[string]fileMark{}
 )
 
-// 逃生文件：存在即明文通判（http_plain）+ 80 短路（port80）全部回退 xray
+// 逃生文件：存在即明文通判（http_plain）+ 80 短路（port80）全部回退 pass
 // （reason 拼写不变，只换 verdict）；关键词/下载站/BSF/下载器特征规则照旧。
-var noPlainHeziPath = envStr("WD_NO_PLAINHTTP_HEZI", "/etc/wxdet/no-plainhttp-hezi")
+var noPlainProxyPath = envStr("WD_NO_PLAINHTTP_PROXY", "/etc/wxdet/no-plainhttp-proxy")
 
-func noPlainHezi() bool {
-	_, err := os.Stat(noPlainHeziPath)
+func noPlainProxy() bool {
+	_, err := os.Stat(noPlainProxyPath)
 	return err == nil
 }
 
@@ -548,11 +548,11 @@ func classify(od dstAddr, b []byte) (string, string) {
 	if len(b) >= 2 && b[1] == 0xF1 {
 		switch b[0] {
 		case 0x15, 0x16, 0x17, 0x19:
-			return "hezi", "mmtls"
+			return "proxy", "mmtls"
 		}
 	}
 	if len(b) >= 1 && b[0] == 0x02 {
-		return "hezi", "oicq"
+		return "proxy", "oicq"
 	}
 	if len(b) >= 8 && b[2] == 0x08 && b[3] == 0x00 &&
 		(b[4] == 0x06 || b[4] == 0x07 || b[4] == 0x08) && b[5] == 0x06 && b[6] == 0x07 && b[7] == 0x62 {
@@ -561,7 +561,7 @@ func classify(od dstAddr, b []byte) (string, string) {
 		// peek 最多截前 1024B，大包恒被截断，故用 decl>=len(b) 而非相等；
 		// 6 固定字节 + 长度自洽，碰撞≈0。
 		if decl := int(binary.BigEndian.Uint16(b[0:2])); decl >= len(b) {
-			return "hezi", "msf"
+			return "proxy", "msf"
 		}
 	}
 	if len(b) >= 20 && b[2] == 0x08 && b[3] == 0x00 &&
@@ -569,7 +569,7 @@ func classify(od dstAddr, b []byte) (string, string) {
 		// MSF 家族 TYPE_COMPRESS 变种（全端口）：QQ Beacon 上报的一种帧形态，
 		// 08 00 命令族 + offset 7 起 13 字节 ASCII 魔串 + 同款 decl>=len 自洽。
 		if decl := int(binary.BigEndian.Uint16(b[0:2])); decl >= len(b) {
-			return "hezi", "msf"
+			return "proxy", "msf"
 		}
 	}
 	if len(b) >= 16 && b[4] == 0x01 &&
@@ -580,7 +580,7 @@ func classify(od dstAddr, b []byte) (string, string) {
 		// 04 "MSF"。实测 QQ 在 443/8080/14000 用此帧头（u16be 分支恒 miss，
 		// 会全部漏过）。u32 decl 语义不明（21 vs peek 长度对不上），故不用
 		// decl 自洽，纯靠 12 固定字节（≈96bit）定性，碰撞可忽略。
-		return "hezi", "msf"
+		return "proxy", "msf"
 	}
 	if len(b) >= 8 && b[0] == 0x00 && b[1] == 0x00 && b[2] == 0x00 &&
 		b[4] == 0x00 && b[5] == 0x00 && b[6] == 0x00 && b[7] == 0xc8 {
@@ -588,7 +588,7 @@ func classify(od dstAddr, b []byte) (string, string) {
 		//（00 00 00 1a/20 00 00 00 c8，疑似 TLV：len + type=200），
 		// u16be/u32be/TYPE_COMPRESS 分支均 miss 会漏过。
 		// 7 固定字节（≈56bit）定性，碰撞可忽略。
-		return "hezi", "msf"
+		return "proxy", "msf"
 	}
 	if len(b) >= 8 && b[0] == 0x08 && b[2] == 0x08 && b[3] == 0x00 &&
 		b[4] == 0x07 && b[5] == 0x06 && b[6] == 0x0c && b[7] == 0x73 {
@@ -597,19 +597,19 @@ func classify(od dstAddr, b []byte) (string, string) {
 		// 与 u16be 分支仅 b[6]/b[7] 之差（0c 73 vs 07 62），独立分支精确
 		// 匹配。b[0] 为常量 0x08 而非长度字节，故不用 decl 自洽，
 		// 纯靠 7 固定字节（≈56bit）定性，碰撞可忽略。
-		return "hezi", "msf"
+		return "proxy", "msf"
 	}
 	if len(b) >= 12 && b[2] == 0x00 && b[3] == 0x01 &&
 		b[6] == 0x21 && b[7] == 0x12 && b[8] == 0xa4 && b[9] == 0x42 {
 		// STUN-over-TCP 媒体腿（全端口）：u16be 首部为后随长度（2 字节前缀），
 		// 00 01 为 Binding Request，21 12 a4 42 为 STUN magic cookie。
 		// 微信视频/直播（tlivesource 信令配套）实测；注意非腾讯 App 的 TCP STUN
-		// 也会命中，误伤代价仅为绕路（hezi 出口仍可达），上线后看 stun verdict
+		// 也会命中，误伤代价仅为绕路（proxy 出口仍可达），上线后看 stun verdict
 		// 的目的分布复核。
 		decl := int(binary.BigEndian.Uint16(b[0:2]))
 		stunLen := int(binary.BigEndian.Uint16(b[4:6]))
 		if decl == 20+stunLen && decl+2 >= len(b) {
-			return "hezi", "stun"
+			return "proxy", "stun"
 		}
 	}
 	if len(b) >= 6 && b[0] == 0x16 && b[1] == 0x03 {
@@ -623,71 +623,71 @@ func classify(od dstAddr, b []byte) (string, string) {
 				return "block", "dns_block"
 			}
 		}
-		// TLS 全端口直连：非 DoH 的 TLS 一律 xray/tls_direct（交给代理核心）；
+		// TLS 全端口转交：非 DoH 的 TLS 一律 pass/tls_direct（转交下游入口）；
 		// 手机 App 基本不用 h2c，TLS 误判不考虑。
-		return "xray", "tls_direct"
+		return "pass", "tls_direct"
 	}
-	// 判定顺序：下载站 Host（xray/dl_direct，bulk 优先于关键词）→ UA/HTTP
-	// 关键词（腾讯身份优先于下载器特征：aweme 等命中即 hezi，短视频流不因
+	// 判定顺序：下载站 Host（pass/dl_direct，bulk 优先于关键词）→ UA/HTTP
+	// 关键词（腾讯身份优先于下载器特征：aweme 等命中即 proxy，短视频流不因
 	// .flv 后缀被 dl_ext 抢走）→ 下载器特征 dl_range → dl_ua → dl_ext →
-	// BSF Host（xray/bsf_direct，http_plain 之前）→ 明文通判 http_plain →
-	// 80 短路 port80 → xray/default。
+	// BSF Host（pass/bsf_direct，http_plain 之前）→ 明文通判 http_plain →
+	// 80 短路 port80 → pass/default。
 	isH := isHTTPRequest(b)
 	if isH {
 		if h := httpHost(b); h != "" && dlDomainHit(h) {
-			return "xray", "dl_direct"
+			return "pass", "dl_direct"
 		}
 	}
 	// UA 头匹配（全端口，不受 80/8080 门限约束）：UA 是客户端自报身份，
 	// 包名级 token（aweme/MicroMessenger）误报≈0，专治 Host 为 IP 的形态。
 	if ua := httpUserAgent(b); ua != "" && kwMatch(ua) {
-		return "hezi", "http_ua_kw"
+		return "proxy", "http_ua_kw"
 	}
 	// 明文 HTTP 关键词（全端口，不设端口门）：方法行语义校验挡随机二进制。
-	// fail-closed（守门员策略）：识别到的包只许进 hezi，hezi 不通即断流，
-	// 绝不回退 xray。宁断不错放。
+	// fail-closed（守门员策略）：识别到的包只许进 proxy，proxy 不通即断流，
+	// 绝不回退 pass。宁断不错放。
 	if r := httpKeyword(b); r != "" {
-		return "hezi", r
+		return "proxy", r
 	}
 	if isH {
 		// 下载器特征三层（请求侧信号；响应侧 206/Content-Length gate 看不到，
 		// 不做）：Range 头（多线程/断点续传/seek 最强信号）→ 下载器 UA →
 		// 二进制/媒体 URL 后缀。Range/UA/后缀一般在首包前 600B 内，超长
-		// Cookie 挤出 1024B peek 窗则 miss，安全落回 http_plain 进 hezi。
+		// Cookie 挤出 1024B peek 窗则 miss，安全落回 http_plain 进 proxy。
 		if hasRangeHeader(b) {
-			return "xray", "dl_range"
+			return "pass", "dl_range"
 		}
 		if ua := httpUserAgent(b); ua != "" && dlUAHit(ua) {
-			return "xray", "dl_ua"
+			return "pass", "dl_ua"
 		}
 		if p := httpPath(b); p != "" && dlExtHit(p) {
-			return "xray", "dl_ext"
+			return "pass", "dl_ext"
 		}
 		// BSF 运营商信令 direct-by-policy（http_plain 之前，不随逃生回滚）。
 		if h := httpHost(b); h != "" && bsfDomainHit(h) {
-			return "xray", "bsf_direct"
+			return "pass", "bsf_direct"
 		}
 		// 明文 HTTP 通判：方法行合法、无关键词、非下载站/BSF。逃生文件存在
-		// 即回退 xray（reason 拼写不变）。
-		if noPlainHezi() {
-			return "xray", "http_plain"
+		// 即回退 pass（reason 拼写不变）。
+		if noPlainProxy() {
+			return "pass", "http_plain"
 		}
-		return "hezi", "http_plain"
+		return "proxy", "http_plain"
 	}
-	// 80 短路（fail-closed）：80 非 HTTP/空载荷无条件进 hezi；逃生回退 xray。
+	// 80 短路（fail-closed）：80 非 HTTP/空载荷无条件进 proxy；逃生回退 pass。
 	if od.port == 80 {
-		if noPlainHezi() {
-			return "xray", "port80"
+		if noPlainProxy() {
+			return "pass", "port80"
 		}
-		return "hezi", "port80"
+		return "proxy", "port80"
 	}
 	// 8000-9000 兜底：魔数/TLS/关键词/下载特征已在上游返回，
-	// 落到这里的非 TLS 私有协议残渣一律 hezi（fail-closed，无视逃生文件，
+	// 落到这里的非 TLS 私有协议残渣一律 proxy（fail-closed，无视逃生文件，
 	// reason 复用 default 以保持 reason 字符串稳定）。
 	if od.port >= 8000 && od.port <= 9000 {
-		return "hezi", "default"
+		return "proxy", "default"
 	}
-	return "xray", "default"
+	return "pass", "default"
 }
 
 func kwMatch(s string) bool {
@@ -817,7 +817,7 @@ func tlsSNI(b []byte) string {
 }
 
 // httpMethods 方法行语义校验表：h2c 的 PRI * HTTP/2.0 不在表里，会穿过
-// 通判走 xray/default（手机 App 基本不用 h2c，记一笔不修）。
+// 通判走 pass/default（手机 App 基本不用 h2c，记一笔不修）。
 var httpMethods = []string{"GET ", "POST ", "HEAD ", "PUT ", "OPTIONS ", "DELETE ", "PATCH ", "CONNECT "}
 
 // isHTTPRequest 方法行语义校验：首行以标准请求方法开头，挡随机二进制。
@@ -904,7 +904,7 @@ func httpUserAgent(b []byte) string {
 func httpKeyword(b []byte) string {
 	// 关键词专用（通判 http_plain 由 classify 后置步骤处理，不在此返回，
 	// 否则 dl_range/dl_ua/dl_ext/BSF 会被短路）：域名 Host 只判 host kw
-	// （无 kw 返回 ""，由通判接住进 hezi）；IP 字面/无 Host 判首行 path kw。
+	// （无 kw 返回 ""，由通判接住进 proxy）；IP 字面/无 Host 判首行 path kw。
 	if !isHTTPRequest(b) {
 		return ""
 	}
@@ -1016,9 +1016,9 @@ func relay(a, b *net.TCPConn, src string, od dstAddr, verdict, reason string, st
 	emitCloseEvent("tcp", src, od, verdict, reason, durMs, upB, downB, closer)
 }
 
-// xrayBindAddr 让发往代理核心（历史命名 xray）的连接带上可还原的源地址
-// （127.0.0.<客户端末位>:<客户端源端口>），使代理核心的连接日志可关联回原始客户端。
-func xrayBindAddr(src net.Addr) (net.IP, int) {
+// passBindAddr 让发往下游普通入口的连接带上可还原的源地址
+// （127.0.0.<客户端末位>:<客户端源端口>），便于在下游连接日志里关联回原始客户端。
+func passBindAddr(src net.Addr) (net.IP, int) {
 	host, portStr, err := net.SplitHostPort(src.String())
 	if err != nil {
 		return nil, 0
@@ -1060,15 +1060,15 @@ func handleConn(raw net.Conn) {
 	n := peekClient(tc, buf, od.port)
 
 	verdict, reason := classify(od, buf[:n])
-	if n == 0 && od.port != 80 && verdict != "hezi" && verdict != "block" {
-		// 非 80 静默连接查 hezi 端点记忆，命中则复用原 reason 进 hezi
+	if n == 0 && od.port != 80 && verdict != "proxy" && verdict != "block" {
+		// 非 80 静默连接查 proxy 端点记忆，命中则复用原 reason 进 proxy
 		// （fail-closed）；未知端点仍 default fail-open（如 5438 类保活）。
-		if rsn, ok := heziMemLookup(od); ok {
-			verdict, reason = "hezi", rsn
+		if rsn, ok := proxyMemLookup(od); ok {
+			verdict, reason = "proxy", rsn
 			writeStat("gate_silentreuse", 1)
 		}
 	}
-	bindIP, bindPort := xrayBindAddr(raw.RemoteAddr())
+	bindIP, bindPort := passBindAddr(raw.RemoteAddr())
 	emitOpen("tcp", src, od, verdict, reason)
 	var up *net.TCPConn
 	if verdict == "block" {
@@ -1077,25 +1077,24 @@ func handleConn(raw net.Conn) {
 		logGate(src, od, "block", reason, buf[:n])
 		return
 	}
-	if verdict == "hezi" {
-		// fail-closed（守门员策略）：识别到的包只许进加密上行组——拨号目标
-		// heziSocks 指向 sing-box gate-hezi 入站(127.0.0.1:10811)，由 hezi
-		// 出口组接续；组内任一条腿可用即不断流，全部不可用才断流
-		//（err/*_hezi_fail），绝不回退直连。若代理核心支持拨号超时重试，
-		// 可在同一请求内重试一次（可选）。非 80 端点同时记入 hezi 端点记忆，
+	if verdict == "proxy" {
+		// fail-closed（守门员策略）：识别到的包只许进代理——拨号目标是下游
+		// 敏感/加密入口（proxySocks，可用 WD_PROXY_SOCKS 覆盖）；下游不可用
+		// 才断流（err/*_proxy_fail），绝不回退直连。若下游支持拨号超时重试，
+		// 可在同一请求内重试一次（可选）。非 80 端点同时记入 proxy 端点记忆，
 		// 供后续静默复用连接收敛。
-		heziMemStore(od, reason)
-		up, err = socks5Dial(heziSocks, od, nil, 0)
+		proxyMemStore(od, reason)
+		up, err = socks5Dial(proxySocks, od, nil, 0)
 		if err != nil {
-			writeStat("gate_hezi_fail", 1)
+			writeStat("gate_proxy_fail", 1)
 			writeStat("gate_dial_err", 1)
-			logGate(src, od, "err", reason+"_hezi_fail", buf[:n])
-			emitErrorEvent("tcp", src, od, "err", reason+"_hezi_fail", err.Error())
-			log.Printf("#%d %s -> %s hezi dial fail (fail-closed): %v", id, src, od, err)
+			logGate(src, od, "err", reason+"_proxy_fail", buf[:n])
+			emitErrorEvent("tcp", src, od, "err", reason+"_proxy_fail", err.Error())
+			log.Printf("#%d %s -> %s proxy dial fail (fail-closed): %v", id, src, od, err)
 			return
 		}
 	} else {
-		up, err = socks5Dial(xraySocks, od, bindIP, bindPort)
+		up, err = socks5Dial(passSocks, od, bindIP, bindPort)
 	}
 	if err != nil {
 		writeStat("gate_dial_err", 1)

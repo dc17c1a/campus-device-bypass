@@ -1,10 +1,10 @@
 package main
 
 // UDP 门：nft 把 STUN（3478/5349/19302 三端口 + 跨端口标准魔数）与 UDP 80/8080 DNAT 到这里。
-// serveUDP 先判 od.port == 80 → hezi/port80_udp，否则走 classifyUDP（标准魔数 + 变种包型）。
-// 中继条件 verdict == "hezi" 即中继：STUN 形状全进 hezi，非 STUN 残渣才直连回源。
+// serveUDP 先判 od.port == 80 → proxy/port80_udp，否则走 classifyUDP（标准魔数 + 变种包型）。
+// 中继条件 verdict == "proxy" 即中继：STUN 形状全进 proxy，非 STUN 残渣才直连回源。
 // 非 STUN（STUN 端口上的混淆包，如 119.147.3.x）-> 直连 dial。
-// fail-closed：hezi 建连失败即丢包（gate_hezi_udp_fail），不回退直连。宁断不错放。
+// fail-closed：proxy 建连失败即丢包（gate_proxy_udp_fail），不回退直连。宁断不错放。
 
 import (
 	"encoding/binary"
@@ -37,8 +37,8 @@ type udpAssoc struct {
 	client    *net.UDPAddr
 	dst       dstAddr
 	up        *net.UDPConn
-	tcp       net.Conn // hezi SOCKS5-UDP associate 控制连接；直连时为 nil
-	toHezi    bool
+	tcp       net.Conn // proxy SOCKS5-UDP associate 控制连接；直连时为 nil
+	toProxy   bool
 	reason    string
 	start     atomic.Int64 // unixnano（uclose dur 基准）
 	last      atomic.Int64 // unixnano
@@ -57,27 +57,27 @@ func classifyUDP(b []byte) (string, string) {
 	}
 	// 标准 STUN：魔数 21 12 a4 42 + 首 2bit 为 0（排除 RTP/DTLS 等）。
 	if b[4] == 0x21 && b[5] == 0x12 && b[6] == 0xa4 && b[7] == 0x42 && b[0]&0xC0 == 0x00 {
-		return "hezi", "stun_udp"
+		return "proxy", "stun_udp"
 	}
 	// 变种 STUN（实测 110.43.86.x 系）：Binding Request 0001 / Response 0101，
 	// transaction 配对，魔数位按流变化。0001/0101 + 20B 在随机流量中碰撞≈0，
-	// 后果也只是绕路 hezi（可达），故首包即判。
+	// 后果也只是绕路 proxy（可达），故首包即判。
 	if (b[0] == 0x00 || b[0] == 0x01) && (b[1] == 0x01 || b[1] == 0x02) {
-		return "hezi", "stun_udp_var"
+		return "proxy", "stun_udp_var"
 	}
 	return "direct", "udp_direct"
 }
 
-// udpVerdict 先判 od.port == 80 → hezi/port80_udp，否则走 classifyUDP。
-// 8000-9000 兜底：STUN 形状保持原归因，仅 direct 残渣翻 hezi/default
+// udpVerdict 先判 od.port == 80 → proxy/port80_udp，否则走 classifyUDP。
+// 8000-9000 兜底：STUN 形状保持原归因，仅 direct 残渣翻 proxy/default
 // （fail-closed，assoc 失败即丢包；reason 复用 default）。
 func udpVerdict(od dstAddr, b []byte) (string, string) {
 	if od.port == 80 {
-		return "hezi", "port80_udp"
+		return "proxy", "port80_udp"
 	}
 	v, r := classifyUDP(b)
 	if v == "direct" && od.port >= 8000 && od.port <= 9000 {
-		return "hezi", "default"
+		return "proxy", "default"
 	}
 	return v, r
 }
@@ -325,7 +325,7 @@ func udpPump(a *udpAssoc, srv *net.UDPConn) {
 			return
 		}
 		p := rb[:n]
-		if a.toHezi {
+		if a.toProxy {
 			var derr error
 			p, derr = socksDecap(p)
 			if derr != nil {
@@ -417,7 +417,7 @@ func serveUDP() {
 		log.Printf("udp gate %s: RECVORIGDSTADDR fail %v (UDP门未启，TCP照常)", udpListenAddr, err)
 		return
 	}
-	log.Printf("wxdet-gate udp on %s (hezi=%s)", udpListenAddr, heziSocks)
+	log.Printf("wxdet-gate udp on %s (proxySocks=%s)", udpListenAddr, proxySocks)
 	go func() {
 		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
@@ -482,7 +482,7 @@ func serveUDP() {
 			}
 		}
 		var out []byte
-		if a.toHezi {
+		if a.toProxy {
 			ip4 := od.ip.To4()
 			if ip4 == nil {
 				continue
@@ -503,25 +503,25 @@ func serveUDP() {
 	}
 }
 
-// newUDPAssoc 建中继（hezi associate 或直连 dial），失败返回 nil（fail-closed：
-// hezi assoc 失败即丢包，不回退直连）。
+// newUDPAssoc 建中继（proxy associate 或直连 dial），失败返回 nil（fail-closed：
+// proxy assoc 失败即丢包，不回退直连）。
 func newUDPAssoc(srv *net.UDPConn, client *net.UDPAddr, od dstAddr, verdict, reason string, first []byte) *udpAssoc {
 	a := &udpAssoc{key: udpAssocKey(client, od), client: client, dst: od, reason: reason}
 	now := time.Now().UnixNano()
 	a.start.Store(now)
 	a.last.Store(now)
 	emitOpen("udp", client.String(), od, verdict, reason)
-	relay := verdict == "hezi"
+	relay := verdict == "proxy"
 	if relay {
-		up, tc, err := socks5UDPAssociate(heziSocks, od)
+		up, tc, err := socks5UDPAssociate(proxySocks, od)
 		if err != nil {
-			writeStat("gate_hezi_udp_fail", 1)
-			logGate(client.String(), od, "err", reason+"_hezi_fail", first)
-			emitErrorEvent("udp", client.String(), od, "err", reason+"_hezi_fail", err.Error())
-			log.Printf("udp %s -> %s hezi assoc fail (fail-closed): %v", client, od, err)
+			writeStat("gate_proxy_udp_fail", 1)
+			logGate(client.String(), od, "err", reason+"_proxy_fail", first)
+			emitErrorEvent("udp", client.String(), od, "err", reason+"_proxy_fail", err.Error())
+			log.Printf("udp %s -> %s proxy assoc fail (fail-closed): %v", client, od, err)
 			return nil
 		}
-		a.up, a.tcp, a.toHezi = up, tc, true
+		a.up, a.tcp, a.toProxy = up, tc, true
 	} else {
 		ip4 := od.ip.To4()
 		if ip4 == nil {
@@ -540,8 +540,8 @@ func newUDPAssoc(srv *net.UDPConn, client *net.UDPAddr, od dstAddr, verdict, rea
 	udpTable[a.key] = a
 	udpMu.Unlock()
 	writeStat("gate_udp_assoc", 1)
-	if a.toHezi {
-		writeStat("gate_hezi_udp", 1)
+	if a.toProxy {
+		writeStat("gate_proxy_udp", 1)
 	} else {
 		writeStat("gate_direct_udp", 1)
 	}
@@ -551,8 +551,8 @@ func newUDPAssoc(srv *net.UDPConn, client *net.UDPAddr, od dstAddr, verdict, rea
 }
 
 func (a *udpAssoc) verdict() string {
-	if a.toHezi {
-		return "hezi"
+	if a.toProxy {
+		return "proxy"
 	}
 	return "direct"
 }

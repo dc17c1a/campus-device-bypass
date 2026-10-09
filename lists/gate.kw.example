@@ -1,5 +1,5 @@
 # gate.kw —— gate TCP 关键词（小写子串匹配 Host / 请求行 / UA）
-# 命中即 verdict=hezi（进加密上行）。按你的实际流量增删。
+# 命中即 verdict=proxy（进代理）。按你的实际流量增删。
 douyincdn.com
 douyinvod.com
 douyinpic.com

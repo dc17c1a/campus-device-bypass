@@ -3,8 +3,8 @@
 #
 # nftables 把受管网段的 TCP 重定向进来（deploy/nftables/30-gate-redir.nft），
 # STUN / UDP 80 / UDP 8080 经 DNAT 进 UDP 门（31-gate-udp.nft）。
-# 本进程 peek 首包判路：命中私有协议指纹/明文特征的流量进加密上行组
-# （sing-box gate-hezi 入站），其余交给代理核心按路由表分流。
+# 本进程 peek 首包判路：命中私有协议指纹/明文特征的流量判 proxy，
+# 拨到下游敏感/加密入口；其余判 pass，转交下游普通入口自行处理。
 #
 # 部署位置：/etc/init.d/wxdet-gate（chmod 755），二进制 /usr/bin/wxdet-gate。
 # 启用：/etc/init.d/wxdet-gate enable && /etc/init.d/wxdet-gate start

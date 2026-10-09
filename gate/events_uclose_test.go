@@ -12,7 +12,7 @@ func TestEventsUCloseLine(t *testing.T) {
 	p := tempEvents(t)
 	src := "192.168.2.50:41000"
 	od := dstAddr{ip: net.ParseIP("203.0.113.7"), port: 3478}
-	emitUCloseEvent("udp", src, od, "hezi", "stun_udp", 5000, 3, 2, 300, 400)
+	emitUCloseEvent("udp", src, od, "proxy", "stun_udp", 5000, 3, 2, 300, 400)
 	lines := readLines(t, p)
 	if len(lines) != 1 {
 		t.Fatalf("uclose must emit 1 line, got %d", len(lines))
@@ -22,7 +22,7 @@ func TestEventsUCloseLine(t *testing.T) {
 		t.Fatalf("uclose not json: %v", err)
 	}
 	if m["event"] != "uclose" || m["proto"] != "udp" || m["src"] != src ||
-		m["dst"] != od.String() || m["verdict"] != "hezi" || m["reason"] != "stun_udp" {
+		m["dst"] != od.String() || m["verdict"] != "proxy" || m["reason"] != "stun_udp" {
 		t.Fatalf("uclose base mismatch: %v", m)
 	}
 	if int(m["dur_ms"].(float64)) != 5000 || int(m["up_pkts"].(float64)) != 3 ||
@@ -40,7 +40,7 @@ func TestAssocCloseEmitsUCloseOnce(t *testing.T) {
 	a := &udpAssoc{key: udpAssocKey(client, od), client: client, dst: od, reason: "stun_udp"}
 	a.start.Store(time.Now().Add(-2 * time.Second).UnixNano())
 	a.last.Store(time.Now().UnixNano())
-	a.toHezi = true
+	a.toProxy = true
 	a.upPkts.Store(2)
 	a.downPkts.Store(1)
 	a.upBytes.Store(120)

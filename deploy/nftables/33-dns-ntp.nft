@@ -3,7 +3,7 @@
 #   - 明文 DNS（TCP/UDP 53）强制重定向到本机 dnsmasq；dnsmasq 的上游不是
 #     校园网的 53，而是本机 https-dns-proxy（DoH），避免明文查询暴露设备画像与域名。
 #   - DoT（TCP 853）直接 reject：逼客户端回到受控 DNS，不给"加密 DNS 直连"
-#     留旁路（DoH 域名/IP 另由 gate 与 sing-box 的 block 名单封堵）。
+#     留旁路（DoH 域名/IP 另由 gate 与下游代理的 block 名单封堵）。
 #   - NTP（UDP 123）重定向到本机：不同设备各自的 NTP 域名/周期也是弱画像信号，
 #     统一到本机后出口只剩路由器一种时钟行为。
 #

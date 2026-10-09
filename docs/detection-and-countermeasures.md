@@ -59,7 +59,7 @@ HTTPS 普及正在把检测重心从 UA 推向 JA3/DPI + 时钟偏移，但受�
 - **原理**：SYN 的 `TTL + 窗口 + MSS + Options 顺序`组合可识别 OS（如
   Linux 64/5840，Win7 128/8192）。
 - **局限**：指纹库对 Win10/11 与手机热点误判多；中间设备会改 MSS；样本常不足。
-- **对抗点**：由代理出口重建连接（ua3f/sing-box），让出口只呈现一种指纹
+- **对抗点**：由代理出口重建连接（ua3f/下游代理），让出口只呈现一种指纹
   （`deploy/ua3f/ua3f.example` 的 `l3_rewrite_*`；`via-ua3f` 出口）。
 
 ### 1.5 TCP 时间戳时钟偏移
@@ -176,7 +176,7 @@ iptables -t nat -I PREROUTING -p udp --dport 123 -j ntp_force_local
 - 激进：FORWARD 默认 DROP 只放行代理用户。副作用：CPU/内存上升、单点故障；
   单账号并发过大（>100–500）仍会被行为检测抓。
 - 本仓库的主角就是这个环节：**gate 决定哪些流量必须进隧道**，
-  sing-box 负责其余流量的精细分流（直连/改写/隧道）。
+  下游代理负责其余流量的精细分流（直连/改写/隧道）。
 
 ### 3.8 DHCP / DNS 收敛
 - DNS 全劫持到 dnsmasq，dnsmasq 上游走 DoH；关 RA 多余 RDNSS；DHCP 只下发
@@ -209,13 +209,13 @@ iptables -t nat -I PREROUTING -p udp --dport 123 -j ntp_force_local
 
 | 检测项 | 本方案对应 | 实现位置 |
 |---|---|---|
-| HTTP UA | 出口 UA 全量改写为统一值 | ua3f（`deploy/ua3f/ua3f.example`，经 sing-box `via-ua3f` 出口） |
+| HTTP UA | 出口 UA 全量改写为统一值 | ua3f（`deploy/ua3f/ua3f.example`，经下游 `via-ua3f` 出口） |
 | IP TTL | 出受管网段统一 TTL=64 | `deploy/nftables/32-egress-fingerprint.nft`（`iot_mangle_post`） |
 | IPID | 原子包 IPID=0 | 同上（`all-ipid-zero-iot`） |
-| TCP 指纹/时间戳 | 直连类流量经 ua3f 重建；`tcp/443` 也规则化走 `via-ua3f` | sing-box 路由 + ua3f `l3_rewrite_*` |
+| TCP 指纹/时间戳 | 直连类流量经 ua3f 重建；`tcp/443` 也规则化走 `via-ua3f` | 下游代理路由 + ua3f `l3_rewrite_*` |
 | NTP | UDP 123 劫持到本机 | `deploy/nftables/33-dns-ntp.nft` + `system.ntp.enable_server` |
-| DNS/DoH 画像 | 53 劫持到 dnsmasq→DoH；853 reject；DoH 域名/IP 封堵 | `33-dns-ntp.nft` + gate 的 DoH 名单（`lists/doh-*.example`）+ sing-box block 规则 |
-| JA3/DPI 应用特征 | 有账号价值的流量（微信/QQ/抖音/游戏/私有协议）全部进加密上行组 | gate 判定 + sing-box `hezi` 组（`deploy/sing-box/example.json`） |
+| DNS/DoH 画像 | 53 劫持到 dnsmasq→DoH；853 reject；DoH 域名/IP 封堵 | `33-dns-ntp.nft` + gate 的 DoH 名单（`lists/doh-*.example`）+ 下游代理 block 规则 |
+| JA3/DPI 应用特征 | 有账号价值的流量（微信/QQ/抖音/游戏/私有协议）全部进代理 | gate 判定（`proxy`） + 下游 `proxy` 组（示例见 `deploy/sing-box/example.json`） |
 | UDP 会话/STUN | STUN 统一进 gate 判定并中继，非 STUN 才直连 | `deploy/nftables/31-gate-udp.nft` + `gate/udp.go` |
 | QUIC 绕过代理链 | `udp/443` reject 逼回 TCP | `32-egress-fingerprint.nft`（`iot_quic_block`） |
 | 私有心跳（客户端类） | 不在本仓库范围（认证层问题） | 另见 §6 的第三方客户端项目 |

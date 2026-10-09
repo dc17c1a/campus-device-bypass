@@ -54,9 +54,9 @@ func emitEvent(m map[string]any) {
 	}
 }
 
-// shouldEmitOpen 过滤唯一例外：xray/tls_direct 只走 stats 计数，不进流。
+// shouldEmitOpen 过滤唯一例外：pass/tls_direct 只走 stats 计数，不进流。
 func shouldEmitOpen(verdict, reason string) bool {
-	return !(verdict == "xray" && reason == "tls_direct")
+	return !(verdict == "pass" && reason == "tls_direct")
 }
 
 func emitOpen(proto, src string, od dstAddr, verdict, reason string) {

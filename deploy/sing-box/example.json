@@ -30,7 +30,7 @@
     },
     {
       "type": "socks",
-      "tag": "gate-hezi",
+      "tag": "proxy-in",
       "listen": "127.0.0.1",
       "listen_port": 10811
     }
@@ -53,7 +53,7 @@
     },
     {
       "type": "socks",
-      "tag": "hezi-direct",
+      "tag": "proxy-direct",
       "server": "127.0.0.1",
       "server_port": 18082,
       "version": "5"
@@ -87,9 +87,9 @@
     },
     {
       "type": "urltest",
-      "tag": "hezi",
+      "tag": "proxy",
       "outbounds": [
-        "hezi-direct",
+        "proxy-direct",
         "lx"
       ],
       "url": "https://www.gstatic.com/generate_204",
@@ -116,9 +116,9 @@
       {
         "action": "route",
         "inbound": [
-          "gate-hezi"
+          "proxy-in"
         ],
-        "outbound": "hezi"
+        "outbound": "proxy"
       },
       {
         "action": "route",
@@ -171,7 +171,7 @@
           5349,
           19302
         ],
-        "outbound": "hezi"
+        "outbound": "proxy"
       },
       {
         "action": "route",
@@ -189,7 +189,7 @@
         "domain_suffix": [
           ".example-app.com"
         ],
-        "outbound": "hezi"
+        "outbound": "proxy"
       },
       {
         "action": "route",

@@ -7,9 +7,9 @@ fw4 的具名 set/链）。文件编号即加载顺序，可自行改名，链�
 | 文件 | 内容 |
 |---|---|
 | `30-gate-redir.nft` | 受管网段 TCP → `:12347` 重定向（`iot_redir`）+ 保留口防护（`drop1080`） |
-| `31-gate-udp.nft` | UDP 三条腿：STUN/UDP80/8080 → gate `:12348`（`iot_stun_dnat`）+ 其余 UDP TPROXY → 下游 `:12346`（`iot_udp_proxy`） |
+| `31-gate-udp.nft` | 受管网段公网 UDP 全量 TPROXY → gate `:12348`（`iot_udp_proxy`，唯一裁判；DNAT 已退役） |
 | `32-egress-fingerprint.nft` | 出口指纹整理：TTL=64、IPID=0、ICMP 伪装、IPv6 drop、QUIC reject |
-| `33-dns-ntp.nft` | DNS 收敛（53 劫持、853 拒绝）与 NTP 劫持 |
+| `33-dns-ntp.nft` | DNS 收敛（53 劫持、TCP/UDP 853 拒绝）与 NTP 劫持 |
 
 ## 使用与注意事项
 
@@ -21,5 +21,5 @@ fw4 的具名 set/链）。文件编号即加载顺序，可自行改名，链�
   小改动用 `nft add/delete rule` 直接热修。不建议动不动 `fw4 reload` —— 它会清零
   全部链计数器，破坏基于计数器的观测与排障基线（本项目大量使用 counter 做 tripwire）。
 - **网段替换**：示例中 `192.168.2.0/24` 为受管网段、`192.168.2.1` 为该网段本机地址、
-  `192.168.71.1` 为上游网关、`br-iot`/`br-lan` 为接口名，全部按你的网络替换。
+  `192.168.10.1` 为上游网关占位、`br-iot`/`br-lan` 为接口名，全部按你的网络替换。
 - 这些片段只覆盖"与分流相关"的部分；完整的防火墙 zone、DHCP、无线配置不在本仓库范围。

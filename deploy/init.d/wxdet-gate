@@ -3,8 +3,8 @@
 #
 # nftables 把受管网段的 TCP 重定向进来（deploy/nftables/30-gate-redir.nft），
 # STUN / UDP 80 / UDP 8080 经 DNAT 进 UDP 门（31-gate-udp.nft）。
-# 本进程 peek 首包判路：命中私有协议指纹/明文特征的流量判 proxy，
-# 拨到下游敏感/加密入口；其余判 pass，转交下游普通入口自行处理。
+# 本进程 peek 首包二判：标准 TLS/明文下载特征判 pass，转交下游普通入口；
+# 其余一切判 proxy，进代理（fail-closed）。
 #
 # 部署位置：/etc/init.d/wxdet-gate（chmod 755），二进制 /usr/bin/wxdet-gate。
 # 启用：/etc/init.d/wxdet-gate enable && /etc/init.d/wxdet-gate start
@@ -18,6 +18,7 @@ start_service() {
 	procd_set_param command /usr/bin/wxdet-gate
 	# 小内存设备（如 256–512MB 级路由器）：软内存上限 + 更积极的 GC，
 	# 防止 Go 运行时 RSS 冲高拖垮整机；数值可按设备内存调整。
+	# （本示例取 40/16MB，比某生产部署的 100/64MB 更保守，按设备内存调整。）
 	procd_set_param env GOGC=40 GOMEMLIMIT=16777216
 	# respawn <阈值秒> <窗口秒> <重试次数>：崩溃自动拉起
 	procd_set_param respawn 3600 5 5

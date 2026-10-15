@@ -1,16 +1,16 @@
 # sing-box 接入说明
 
-`example.json` 是从实际部署裁剪出的**最小可跑骨架**（原部署为 sing-box 1.14.x，
-31 条路由；示例保留结构语义、裁掉长名单）。配合 `deploy/nftables/31-gate-udp.nft`
-与 `deploy/init.d/iot-tproxy` 即可让 UDP TPROXY、gate 判流、UA 改写三条链完整跑通。
+`example.json` 是从实际部署裁剪出的**结构示例**（原部署为 sing-box 1.14.x 早期形态；
+现网路由已瘦身为三条：gate 代理入口→隧道组、私网→直连、TCP 兜底→经指纹整理出口，
+本示例保留旧结构作格式参考，路由语义以本说明的“路由顺序”为准）。
 
 ## 入站
 
 | tag | 端口 | 作用 |
 |---|---|---|
-| `socks` | `127.0.0.1:10808` | 通用 SOCKS5/mixed：gate 判 `pass` 的流量从这里进；也是本机排障入口（`curl -x socks5h://127.0.0.1:10808 ...`） |
+| `socks` | `127.0.0.1:10808` | 通用 SOCKS5/mixed：本机排障/管理入口（`curl -x socks5h://127.0.0.1:10808 ...`）；gate 的 `pass` 默认直拨 `:18081`，不经这里（可改 `WD_PASS_SOCKS` 接入） |
 | `proxy-in` | `127.0.0.1:10811` | **gate 判 `proxy` 专用**：gate 的 fail-closed 拨号目标，只监听 loopback |
-| `transparent-udp` | `[::]:12346` | nft `tproxy` 送进来的 UDP（配合策略路由） |
+| `transparent-udp` | `[::]:12346` | **已退役**：UDP 全量改走 TPROXY 进 gate `:12348`，本入站不再收包（`example.json` 内保留作格式参考） |
 
 ## 出站
 
@@ -37,7 +37,7 @@
    否则加密 DNS 会被 443 兜底规则送进普通出口。
 4. `tcp/443` → `via-ua3f`：443 流量也要过 UA/指纹整理（有意为之，不是最终直连）。
 5. 下载站 / 运营商 BSF 信令域名 → `via-ua3f`（走代理出口但统一指纹）。
-6. STUN 端口 → `proxy`（nft 已先 DNAT 进 gate，这里是双保险）。
+6. STUN 端口 → `proxy`（gate 已在 UDP 门内判定，这里是下游侧双保险；现网瘦身后此条已删）。
 7. 私网段 → `direct`（不进隧道）。
 8. 业务域名（微信/抖音/游戏等）→ `proxy`：这些流量在校园网侧有应用层/账号级
    检测价值，全部藏进隧道。

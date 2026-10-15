@@ -19,7 +19,7 @@ func TestClassifyUDP(t *testing.T) {
 	// 变种（某系）：0001/0101 + 按流魔数 + txn 配对
 	varReq := append([]byte{0x00, 0x01, 0x00, 0x08, 0x01, 0x39, 0xf4, 0x5c}, txn...)
 	varResp := append([]byte{0x01, 0x01, 0x00, 0x48, 0x01, 0x39, 0xf4, 0x5c}, txn...)
-	// 混淆包（实测 119.147.3.59:3478）：20B 随机
+	// 混淆包（某源 3478）：20B 随机
 	obf, _ := hex.DecodeString("3bcaac48c3eeefe893a6bcb5d39e90939eb4b3d1")
 	rtp := bytes.Repeat([]byte{0x80}, 40) // RTP 首字节 10xxxxxx
 	cases := []struct {
@@ -95,8 +95,8 @@ func mkOrigDstCmsg(ip [4]byte, port int) []byte {
 }
 
 func TestParseOrigDst(t *testing.T) {
-	od, ok := parseOrigDst(mkOrigDstCmsg([4]byte{74, 125, 250, 129}, 19302))
-	if !ok || od.port != 19302 || od.ip.String() != "74.125.250.129" {
+	od, ok := parseOrigDst(mkOrigDstCmsg([4]byte{203, 0, 113, 23}, 19302))
+	if !ok || od.port != 19302 || od.ip.String() != "203.0.113.23" {
 		t.Fatalf("got %v %v", od, ok)
 	}
 	if _, ok := parseOrigDst(nil); ok {

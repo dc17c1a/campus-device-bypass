@@ -261,7 +261,7 @@ func matchDomainSuffix(sni string, set map[string]bool) bool {
 }
 
 // 下载站/下载器名单（30s 热加载，lists/ 镜像）：
-// dl-domains 精确/子域匹配记 direct/dl_direct；dl-ua 为 UA token 子串匹配记
+// dl-domains 精确/子域匹配记 pass/dl_direct；dl-ua 为 UA token 子串匹配记
 // pass/dl_ua；dl-ext 为 URL 后缀匹配记 pass/dl_ext；dl-query 为 URL query
 // 预签名/强制下载参数子串匹配记 pass/dl_query（不依赖 Host 名单的新增召回）。
 // 单文件缺失保留旧快照。

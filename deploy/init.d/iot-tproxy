@@ -1,9 +1,9 @@
 #!/bin/sh /etc/rc.common
 # TPROXY 策略路由：给被 nft `tproxy` 打上 mark 0x100 的 UDP 包一条投递路径
-# （下游 transparent-udp:12346，示例见 deploy/sing-box）。缺少这两条时，包会被标记但无路可走而被丢弃。
+# （gate UDP :12348，IP_TRANSPARENT 监听）。缺少这两条时，包会被标记但无路可走而被丢弃。
 #
 # 与 deploy/nftables/31-gate-udp.nft 的 `meta mark set 0x100` /
-# `tproxy ip to :12346` 配套；无 UDP 代理分流时可不用本文件。
+# `tproxy ip to :12348` 配套。
 #
 # 幂等：start 前先 del，避免重复调用导致 rule 堆叠（实测踩过）。
 START=18

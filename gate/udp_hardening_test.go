@@ -406,7 +406,7 @@ func TestUDPAssocSlowConnectDoesNotBlock(t *testing.T) {
 	a.close()
 }
 
-// ---------- P2-9：direct→proxy 单向升级 ----------
+// ---------- P2-9：pass→proxy 单向升级 ----------
 
 func TestUDPAssocUpgradePassToProxy(t *testing.T) {
 	statsPath := tempStatFile(t)

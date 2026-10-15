@@ -2,7 +2,7 @@ package main
 
 // UDP 门：serveUDP 经 udpVerdict 先判 STUN 形状（标准魔数+长度一致/变种形状，
 // 任意端口命中即 proxy），非 STUN 再按端口：od.port <= 10000 → proxy/udp_proxy，
-// >10000 → direct（classifyUDP 原样理由 udp_direct/udp_short）。
+// >10000 → pass（classifyUDP 原样理由 udp_direct/udp_short）。
 // 中继条件仍 verdict == "proxy" 即中继。verdict 面与旧版逐包一致，唯一差别是
 // 低端口 STUN 包的 reason 由 udp_proxy 改记 stun_udp/stun_udp_var（统计更细）。
 // fail-closed：proxy 建连失败即丢包（gate_proxy_udp_fail），不回退直连。宁断不错放。
@@ -674,7 +674,7 @@ func serveUDP() {
 			continue
 		}
 		// 防环：真实目的永不该是本地/私网/链路地址（STUN/UDP 80 服务器恒为公网）。
-		// 否则 direct-dial 会把包写回自己形成自激（自测 FIXED_DST 踩过一次，512 表打满）。
+		// 否则 pass-dial 会把包写回自己形成自激（自测 FIXED_DST 踩过一次，512 表打满）。
 		if od.ip.IsLoopback() || od.ip.IsPrivate() || od.ip.IsLinkLocalUnicast() || od.ip.IsUnspecified() {
 			writeStat("gate_udp_local_drop", 1)
 			logUDPLocalDrop(caddr.String(), od, buf[:n])

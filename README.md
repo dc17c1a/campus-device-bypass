@@ -70,10 +70,9 @@ flowchart TB
 
     subgraph NFT["nftables（inet fw4，见 deploy/nftables/）"]
         R1["iot_redir<br/>TCP 除 53/1080、私网、上游网关<br/>redirect :12347"]
-        R2["iot_stun_dnat<br/>STUN 三端口/魔数、UDP 80/8080<br/>dnat :12348"]
-        R3["iot_udp_proxy<br/>其余 UDP<br/>mark 0x100 + TPROXY :12346"]
+        R2["iot_udp_proxy<br/>公网 UDP 全量（除 53/123/443/853）<br/>mark 0x100 + TPROXY :12348"]
         R4["iot_quic_block<br/>UDP 443 reject"]
-        R5["dns_force_* / iot_ntp_hijack<br/>53 劫持、853 拒绝、123 劫持"]
+        R5["dns_force_* / iot_ntp_hijack<br/>53 劫持、853 TCP/UDP 拒绝、123 劫持"]
         R6["iot_mangle_post<br/>TTL=64、IPID=0、ICMP 伪装、IPv6 drop"]
     end
 
@@ -83,9 +82,8 @@ flowchart TB
     end
 
     subgraph SB["下游代理（示例：deploy/sing-box/example.json）"]
-        SG["proxy-in :10811<br/>仅 loopback，proxy 专用"]
-        SS["下游普通入口（示例 socks :10808；<br/>代码默认直拨 :18081 做指纹整理）"]
-        SU["transparent-udp :12346"]
+        SG["proxy-in :10811<br/>仅 loopback，proxy 专用（对照现网 gate-hezi）"]
+        SS["下游 socks :10808<br/>管理/排障入口（不接 gate）"]
         SR["route.rules 分流"]
         SH["proxy 出口组（urltest）"]
     end
@@ -97,16 +95,14 @@ flowchart TB
     NET["出口：br-lan → 校园网上游"]
 
     C -->|"TCP"| R1 --> GT
-    C -->|"STUN / UDP 80 / 8080"| R2 --> GU
-    C -->|"其余 UDP"| R3 --> SU
+    C -->|"公网 UDP 全量"| R2 --> GU
     C -->|"UDP 443"| R4
     C -->|"DNS / NTP"| R5 --> DNS
     C -.->|"所有出境流量都过（mangle postrouting）"| R6
 
     GT -->|"proxy：除 TLS/下载特征外一切"| SG
-    GT -->|"pass：TLS/下载特征"| SS
+    GT -->|"pass：TLS/下载特征"| U3
     SS --> SR
-    SU --> SR
     SG --> SH
     SR -->|"direct"| NET
     SR -->|"via-ua3f"| U3 --> NET
@@ -123,7 +119,7 @@ flowchart TB
 |---|---|---|
 | TCP（除 53/1080、私网、上游网关目的） | `iot_redir` → **gate TCP :12347** | gate 二判：`pass`（TLS/下载特征）转交下游入口 / `proxy`（其余）进代理 |
 | STUN（三端口 + 任意端口魔数）、UDP 80、UDP 8080 | `iot_stun_dnat` → **gate UDP :12348** | gate 判定 STUN 形状；`proxy` 走 SOCKS5-UDP 中继 |
-| 其余 UDP | `iot_udp_proxy` → 下游 `transparent-udp :12346` | 不经 gate；下游按 IP/端口路由，默认直连 |
+| 公网 UDP（除 53/123/443/853） | `iot_udp_proxy` → **gate UDP :12348** | gate 判定：`proxy` 中继 / `pass` 直拨回源 |
 | UDP 443（QUIC） | `iot_quic_block` reject | 不经 gate；逼客户端回落 TCP，才能进代理链 |
 | DNS（53）、DoT（853）、NTP（123） | `dns_force_*` / `iot_ntp_hijack` → 本机 dnsmasq/NTP | 不经 gate；上游 DoH，加密 DNS 封堵由下游代理名单执行 |
 | 私网互访、发往上游网关的管理流量 | 直接放行 | 不经 gate |
@@ -175,6 +171,7 @@ flowchart TB
 | 标准 STUN 魔数 `21 12 a4 42` + 首 2bit 为 0 + 长度一致 | `proxy/stun_udp` | 代理（SOCKS5-UDP 中继） |
 | 变种 STUN（`0001/0101` 包型，事务配对） | `proxy/stun_udp_var` | 代理（SOCKS5-UDP 中继） |
 | 非 STUN 且目的端口 ≤10000 | `proxy/udp_proxy` | 代理（SOCKS5-UDP 中继） |
+| 短包（<20B）且目的端口 ≤10000 | `proxy/udp_proxy` | 代理（形状不足判代理，fail-closed） |
 | 短包（<20B）/非 STUN 且目的端口 >10000 | `pass/udp_short`、`pass/udp_direct` | 直连回源（直拨目的） |
 
 - **中继语义**：`verdict==proxy` 即中继（经下游 `proxy` 入口的 SOCKS5-UDP associate）；
@@ -192,7 +189,7 @@ flowchart TB
 | `proxy` | 必须走代理：拨到下游代理入口；失败不回退。`reason` 说明证据，`err/*_proxy_fail` 表示下游拨号失败 |
 | `pass` | TCP：转交下游普通入口（env `WD_PASS_SOCKS`，默认直拨 `:18081` 做指纹整理）；UDP：直拨目的直连回源 |
 | `dl_*` | 下载站/下载器转交策略标签（`reason` 证据名保留 `_direct` 后缀） |
-| `*_proxy_fail` / `*_pass_fail` | 下游拨号失败；fail-closed，不回退、不改拨第二腿 |
+| `*_proxy_fail` | 代理拨号失败（`reason` 原样 + 后缀）；`pass` 腿失败只记 `gate_pass_fail` 计数，`reason` 不加后缀；一律 fail-closed，不回退、不改拨第二腿 |
 
 ### 3.4 名单与热加载
 
@@ -322,6 +319,7 @@ tail -5 /tmp/wxdet/events.jsonl      # 统一事件流
 | `WD_KW_POLL_SEC` | `30` | 名单轮询周期（秒），`<=0` 关闭 |
 | `WD_LOG` / `WD_STATS` / `WD_EVENTS` | `/tmp/wxdet/gate.log` / `stats.tsv` / `events.jsonl` | 观测输出 |
 | `WD_UDP_FIXED_DST` | 空 | 调试用：跳过 origdst，固定中继目的（生产勿设） |
+| `WD_UDP_ERR_LOG` | `/tmp/wxdet/udp_err.log` | UDP 门错误采样日志（每进程 5 秒一行） |
 
 ## 6. 排障 FAQ
 
@@ -340,7 +338,8 @@ tail -5 /tmp/wxdet/events.jsonl      # 统一事件流
 
 **Q：端口容易搞混。**
 本方案：`18081` = 下游普通入口（gate `pass` 默认拨号目标）；`10811` = `proxy` 专用
-loopback 入站；`10808` = 下游 socks/mixed 示例入口；`12346` = UDP TPROXY；
+loopback 入站；`10808` = 下游 socks/mixed 示例入口；`12346` 已退役
+（旧 TPROXY 下游口，现 UDP 全量进 gate `:12348`）；
 `12347/12348` = gate TCP/UDP。
 注意 scheme 要对：把 `socks5h://` 打到 HTTP 代理上会得到
 `malformed HTTP request` + 超时，是假故障。
@@ -385,8 +384,17 @@ gate 是纯转发进程，Go 运行时按小内存路由器调优（示例 `GOGC
 
 ## 9. 维护说明
 
-本仓库是参考部署的**公开发行版**：`gate/` 与上游私有部署版本保持逻辑级同步
-（公开整理只动注释，不动作息），部署示例按公开可复现原则做了命名与脱敏处理。
+本仓库是参考部署的**公开发行版**：`gate/` 与私有部署版本保持逻辑级同步
+（仅做命名脱敏与注释泛化，行为一致，`make` 门禁相同用例），部署示例按公开
+可复现原则做了命名与脱敏处理。私有侧→公开侧命名映射：
+
+| 私有 | 公开 | 说明 |
+|---|---|---|
+| verdict `direct` | `pass` | 含义不变：转交下游普通入口（TCP）/直连回源（UDP） |
+| verdict `hezi` | `proxy` | 含义不变：必须走代理 |
+| `WD_UA3F_SOCKS` | `WD_PASS_SOCKS` | 默认同为 `127.0.0.1:18081` |
+| `WD_HEZI_SOCKS` | `WD_PROXY_SOCKS` | 默认同为 `127.0.0.1:10811` |
+| `gate_direct_fail` / `gate_hezi_*` | `gate_pass_fail` / `gate_proxy_*` | 统计键同上映射 |
 四份区域（`gate/`、`deploy/`、`lists/`、`docs/`）各自独立演进，改动建议附测试
 （`make` 会跑 gofmt/vet/test）。
 

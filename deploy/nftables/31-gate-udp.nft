@@ -1,36 +1,22 @@
-# UDP 三条腿（受管网段）：
+# UDP 全量 TPROXY 进 gate（受管网段）：
 #
-#   1) STUN（任意端口标准魔数 + 常用三端口 {3478,5349,19302}）与 UDP 80/8080：
-#      DNAT 到 gate 的 UDP 门 :12348。gate 先于下游入口做 STUN 判定：
-#      verdict==proxy 即经加密上行中继，非 STUN 残渣才直连回源；assoc 失败
-#      fail-closed（丢包，不回退）。
-#   2) 其余 UDP：mark 0x100 后 TPROXY 进下游 transparent-udp :12346，
-#      由下游路由表分流（与 TCP 相同的 direct/via-ua3f/proxy/block 语义）。
-#      需要策略路由配合：deploy/init.d/iot-tproxy。
-#   3) UDP 443 由 32-egress-fingerprint.nft 的 iot_quic_block reject，逼客户端
-#      回落 TCP —— 只有回落 TCP 的流量才能进代理链（QUIC 是检测与绕过的黑洞）。
+#   受管网段公网 UDP 全量经 TPROXY 交给 udp gate :12348（唯一裁判），由 gate
+#   按 STUN 形状 + 目的端口 verdict：STUN 任意端口 → proxy（SOCKS5-UDP 中继）；
+#   非 STUN ≤10000 → proxy；>10000 → pass（直拨回源）。IP 名单不参与 UDP 判决。
+#   排除集：53（DNS 劫持，见 33-dns-ntp.nft）、123（NTP 劫持）、443（QUIC，
+#   forward REJECT，见 32-egress-fingerprint.nft）、853（DoQ，forward REJECT）、
+#   私网/组播/广播目的（本地流量不上门）。
 #
-# 优先级与顺序陷阱：本链挂在 prerouting mangle+5（先于 dstnat），所以
-#   - 标准 STUN 魔数包必须在这里先 `accept`（bypass TPROXY），否则被 TPROXY
-#     抢先送进下游入口（流量仍通，但绕过 gate 的 STUN 归因）；
-#   - dport 80/8080 必须从 TPROXY 规则里排除（见下），否则同样被抢先吃掉。
-# 短包够不到 @th,96,32 时魔数规则自然不命中，由 TPROXY 规则原样接住，行为不变。
+# 为何不用 DNAT：IP_RECVORIGDSTADDR 在本机返回 NAT 后目的，DNAT 进门恒黑洞；
+# TPROXY 不改写目的，cmsg 才是真目的。退役的 DNAT 四规则（STUN 三端口/魔数/
+# UDP80/8080）已删除，不要加回来。
 #
-# 网段/地址按你的网络替换（192.168.2.1 = 本机受管网段地址，DNAT 目标）。
+# 依赖: ip rule fwmark 0x100 lookup 100 + ip route local 0.0.0.0/0 dev lo table 100
+#       (由 /etc/init.d/iot-tproxy 持久化)；gate 侧 IP_TRANSPARENT（否则收不到 divert 包）。
+# 切换前后 `conntrack -D -p udp`（不断 TCP），旧条目会把流量钉死在旧路。
+#
+# 网段按你的网络替换（192.168.2.0/24 = 受管网段地址）。
 chain iot_udp_proxy {
 	type filter hook prerouting priority mangle + 5; policy accept;
-	ip saddr 192.168.2.0/24 ip protocol udp @th,96,32 == 0x2112a442 counter accept comment "stun-magic-bypass-tproxy"
-	ip saddr 192.168.2.0/24 udp dport != { 53, 80, 123, 443, 3478, 5349, 8080, 19302 } ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } meta mark set 0x00000100 counter tproxy ip to :12346 comment "udp-to-proxy"
-}
-
-chain iot_stun_dnat {
-	type nat hook prerouting priority dstnat; policy accept;
-	# 规则1：STUN 常用三端口 —— 端口命中即进门（含变种/私有打洞包，不要求魔数形状）
-	ip saddr 192.168.2.0/24 udp dport { 3478, 5349, 19302 } ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter dnat ip to 192.168.2.1:12348 comment "stun-to-gate-udp"
-	# 规则2：跨端口标准魔数 —— 游戏语音/打洞常用 8000/1106 等任意端口，只抓标准 STUN 形状
-	ip saddr 192.168.2.0/24 udp dport != { 53, 123, 3478, 5349, 19302 } ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } @th,96,32 == 0x2112a442 counter dnat ip to 192.168.2.1:12348 comment "stun-magic-to-gate-udp"
-	# 规则3：UDP 80 —— gate 侧直接判 proxy/port80_udp（fail-closed）
-	ip saddr 192.168.2.0/24 udp dport 80 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter dnat ip to 192.168.2.1:12348 comment "udp80-to-gate-udp"
-	# 规则4：UDP 8080 —— gate 侧落 8000-9000 兜底 → proxy/default（fail-closed）
-	ip saddr 192.168.2.0/24 udp dport 8080 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter dnat ip to 192.168.2.1:12348 comment "udp8080-to-gate-udp"
+	ip saddr 192.168.2.0/24 udp dport != { 53, 123, 443, 853 } ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } meta mark set 0x00000100 counter tproxy ip to :12348 comment "udp-all-to-gate-tproxy"
 }

@@ -109,9 +109,15 @@ flowchart TB
         UA["指纹整理 :18081<br/>UA 归一 + L3 复写"]
         PX["隧道组<br/>按延迟选路 + 故障转移"]
         DR["直连出口"]
-        ZP["出口 TCP 80/443<br/>NFQUEUE 脱敏"]
         NET["公网出口"]
         FP["TTL / IPID / MSS 统一整理"]
+    end
+
+    subgraph ZAP["六 zapret（出口 TCP 80/443 NFQUEUE 脱敏）"]
+        direction LR
+        ZQ["进队规则<br/>出向首包 + 回包握手散件<br/>管理端口与豁免目的放行"]
+        ZN["nfqws 脱敏<br/>伪造分片 / 乱序 / 坏序列<br/>打标豁免不二次改写"]
+        ZX["豁免回流<br/>已脱敏包直接放行"]
     end
 
     C -->|"TCP"| R1 --> GT
@@ -138,9 +144,11 @@ flowchart TB
     SR0 --> PX
     SR1 --> DR
     SR2 --> UA
-    UA --> ZP
-    DR --> ZP
-    ZP --> NET
+    UA --> ZQ
+    DR --> ZQ
+    ZQ --> ZN
+    ZN --> ZX
+    ZX --> NET
     PX --> NET
     UA -.-> FP
     R3 -.-> FP
@@ -155,7 +163,7 @@ flowchart TB
     classDef side fill:#F8FAFC,stroke:#64748B,stroke-width:1.5px,color:#334155;
 
     class C,GW,UP,NET src;
-    class R1,R2,ZP nft;
+    class R1,R2,ZQ,ZN nft;
     class GT,GU,GP,GX,GS,GL gate;
     class SI,SR0,SR1,SR2 sb;
     class PX tun;

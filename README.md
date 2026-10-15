@@ -15,7 +15,7 @@
   URL query 签名 / 下载器 UA / 二进制后缀）判 `pass` 转交下游；其余一切
   （含静默/非标/私有协议）判 `proxy` 进加密上行，**fail-closed**（代理不可用
   宁断流，不回退）。
-- **UDP 分流**：nft DNAT 进来的 STUN / UDP 80 / UDP 8080 由 gate 判定，
+- **UDP 分流**：受管网段公网 UDP 全量 TPROXY 进 gate `:12348` 判定，
   STUN 形状全量中继进隧道，assoc 失败 fail-closed；非代理 UDP 直连回源，
   下行经透明 socket 欺骗源地址（握手校验源的客户端可接受），失败降级。
 - **名单热加载**：30 秒按 mtime/size 热更新，不断连接；进程内存占用按小内存
@@ -64,53 +64,104 @@ docs/            多设备检测与对抗补充文档
 
 ```mermaid
 flowchart TB
-    subgraph LAN["受管网段（br-iot 192.168.2.0/24）"]
-        C["手机 / PC / 游戏机 / 平板 ..."]
+    subgraph LAN["一 流量来源"]
+        C["受管设备<br/>受管网段（示例 192.168.2.0/24）"]
+        GW["旁路网关本机"]
+        UP["校园网上游网关"]
     end
 
-    subgraph NFT["nftables（inet fw4，见 deploy/nftables/）"]
-        R1["iot_redir<br/>TCP 除 53/1080、私网、上游网关<br/>redirect :12347"]
+    subgraph NFT["二 nftables 分流（见 deploy/nftables/）"]
+        R1["iot_redir<br/>TCP 除 53/保留口、私网、上游网关<br/>redirect :12347"]
         R2["iot_udp_proxy<br/>公网 UDP 全量（除 53/123/443/853）<br/>mark 0x100 + TPROXY :12348"]
-        R4["iot_quic_block<br/>UDP 443 reject"]
-        R5["dns_force_* / iot_ntp_hijack<br/>53 劫持、853 TCP/UDP 拒绝、123 劫持"]
-        R6["iot_mangle_post<br/>TTL=64、IPID=0、ICMP 伪装、IPv6 drop"]
+        R3["旁路链<br/>53 劫持 / 853 拒绝 / 123 劫持<br/>443 QUIC 拒绝 / 出口指纹整理"]
     end
 
-    subgraph GATE["wxdet-gate（本仓库）"]
-        GT["TCP :12347<br/>peek 首包二判<br/>TLS/下载特征→pass，其余→proxy"]
-        GU["UDP :12348<br/>STUN 判定 + 中继/直拨<br/>下行透明 socket 保源"]
+    subgraph GATE["三 wxdet-gate 唯一裁判（本仓库 gate/，fail-closed）"]
+        direction TB
+        subgraph GTCP["TCP 门 :12347（peek 首包二判）"]
+            direction LR
+            GT["取真目的 classifyEx"]
+            GP["TLS 严判 / HTTP 下载特征<br/>Host名单 Range query UA 后缀<br/>判 pass（转交下游）"]
+            GX["其余一切与静默<br/>判 proxy（进代理）"]
+            GD["本机私网目的丢弃<br/>防自环打满 fd"]
+        end
+        subgraph GUDP["UDP 门 :12348（TPROXY 真目的 + 透明回包）"]
+            direction LR
+            GU["取真目的 udpVerdict"]
+            GS["STUN 形状命中<br/>任意端口判 proxy"]
+            GL["非 STUN 目的口 ≤10000<br/>判 proxy"]
+            GH["非 STUN 目的口 >10000 / 短包<br/>判 pass，直拨回源"]
+            GUD["本机私网目的丢弃"]
+        end
+        GF["fail-closed<br/>拨号/中继失败即断流<br/>不改拨第二腿"]
     end
 
-    subgraph SB["下游代理（示例：deploy/sing-box/example.json）"]
-        SG["proxy-in :10811<br/>仅 loopback，proxy 专用（对照现网 gate-hezi）"]
-        SS["下游 socks :10808<br/>管理/排障入口（不接 gate）"]
-        SR["route.rules 分流"]
-        SH["proxy 出口组（urltest）"]
+    subgraph SB["四 下游路由（示例 deploy/sing-box/，现网已瘦身为三规则）"]
+        direction LR
+        SI["入站<br/>代理专用 :10811 / 管理 :10808"]
+        SR0["代理入口命中 → 隧道组"]
+        SR1["私网 / 私有域名 → 直连"]
+        SR2["TCP 兜底 → 经指纹整理出口"]
     end
 
-    U3["ua3f :18081<br/>UA 归一 + L3 指纹"]
-    TUN["隧道腿<br/>hysteria2 / 自建节点 ..."]
-    BLK["block：直接断流"]
-    DNS["dnsmasq → https-dns-proxy（DoH）"]
-    NET["出口：br-lan → 校园网上游"]
+    subgraph EG["五 出口与整理"]
+        direction LR
+        UA["指纹整理 :18081<br/>UA 归一 + L3 复写"]
+        PX["隧道组<br/>按延迟选路 + 故障转移"]
+        DR["直连出口"]
+        ZP["出口 TCP 80/443<br/>NFQUEUE 脱敏"]
+        NET["公网出口"]
+        FP["TTL / IPID / MSS 统一整理"]
+    end
 
     C -->|"TCP"| R1 --> GT
-    C -->|"公网 UDP 全量"| R2 --> GU
-    C -->|"UDP 443"| R4
-    C -->|"DNS / NTP"| R5 --> DNS
-    C -.->|"所有出境流量都过（mangle postrouting）"| R6
+    C -->|"公网 UDP"| R2 --> GU
+    C -.->|"DNS / NTP / QUIC"| R3
+    GT --> GP
+    GT --> GX
+    GT --> GD
+    GP -->|"pass"| UA
+    GX -->|"proxy"| SI
+    GU --> GS
+    GU --> GL
+    GU --> GH
+    GU --> GUD
+    GS -->|"proxy"| SI
+    GL -->|"proxy"| SI
+    GH -->|"pass 直拨"| DR
+    GX -.->|"拨号失败"| GF
+    GP -.->|"拨号失败"| GF
+    GS -.->|"中继失败"| GF
+    SI --> SR0
+    SI --> SR1
+    SI --> SR2
+    SR0 --> PX
+    SR1 --> DR
+    SR2 --> UA
+    UA --> ZP
+    DR --> ZP
+    ZP --> NET
+    PX --> NET
+    UA -.-> FP
+    R3 -.-> FP
 
-    GT -->|"proxy：除 TLS/下载特征外一切"| SG
-    GT -->|"pass：TLS/下载特征"| U3
-    SS --> SR
-    SG --> SH
-    SR -->|"direct"| NET
-    SR -->|"via-ua3f"| U3 --> NET
-    SR -->|"proxy"| SH
-    SR -->|"block"| BLK
-    GU -->|"proxy：STUN 中继"| SG
-    GU -->|"pass：直连回源（透明 socket 保源）"| NET
-    SH --> TUN --> NET
+    classDef src fill:#FFFFFF,stroke:#475569,stroke-width:2px,color:#1E293B;
+    classDef nft fill:#FFFBEB,stroke:#D97706,stroke-width:2.5px,color:#92400E;
+    classDef gate fill:#FFF7ED,stroke:#EA580C,stroke-width:2.5px,color:#9A3412;
+    classDef sb fill:#F5F3FF,stroke:#7C3AED,stroke-width:2.5px,color:#5B21B6;
+    classDef tun fill:#EFF6FF,stroke:#2563EB,stroke-width:2px,color:#1E40AF;
+    classDef ok fill:#ECFDF5,stroke:#059669,stroke-width:2px,color:#065F46;
+    classDef drop fill:#FEF2F2,stroke:#DC2626,stroke-width:2px,color:#991B1B;
+    classDef side fill:#F8FAFC,stroke:#64748B,stroke-width:1.5px,color:#334155;
+
+    class C,GW,UP,NET src;
+    class R1,R2,ZP nft;
+    class GT,GU,GP,GX,GS,GL gate;
+    class SI,SR0,SR1,SR2 sb;
+    class PX tun;
+    class UA,DR,GH ok;
+    class GD,GUD,GF drop;
+    class R3,FP side;
 ```
 
 ### 2.2 哪些流量经过 gate，哪些不经过
@@ -118,7 +169,7 @@ flowchart TB
 | 流量 | 路径 | 说明 |
 |---|---|---|
 | TCP（除 53/1080、私网、上游网关目的） | `iot_redir` → **gate TCP :12347** | gate 二判：`pass`（TLS/下载特征）转交下游入口 / `proxy`（其余）进代理 |
-| STUN（三端口 + 任意端口魔数）、UDP 80、UDP 8080 | `iot_stun_dnat` → **gate UDP :12348** | gate 判定 STUN 形状；`proxy` 走 SOCKS5-UDP 中继 |
+| 公网 UDP（除 53/123/443/853） | `iot_udp_proxy` 全量 TPROXY → **gate UDP :12348** | gate 判定 STUN 形状与目的端口；`proxy` 走 SOCKS5-UDP 中继 |
 | 公网 UDP（除 53/123/443/853） | `iot_udp_proxy` → **gate UDP :12348** | gate 判定：`proxy` 中继 / `pass` 直拨回源 |
 | UDP 443（QUIC） | `iot_quic_block` reject | 不经 gate；逼客户端回落 TCP，才能进代理链 |
 | DNS（53）、DoT（853）、NTP（123） | `dns_force_*` / `iot_ntp_hijack` → 本机 dnsmasq/NTP | 不经 gate；上游 DoH，加密 DNS 封堵由下游代理名单执行 |

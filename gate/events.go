@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// 统一事件流：WD_EVENTS，默认 /tmp/wxdet/events.jsonl，O_APPEND。
+// 统一事件流（P1）：WD_EVENTS，默认 /tmp/wxdet/events.jsonl，O_APPEND。
 // 与 gate.log/stats.tsv 共存，老文件一行不动；写入失败只记 stats，不影响转发。
 // reason 冻结、fail-closed/fail-open 语义零改动（本文件只做落盘）。
 var (
@@ -54,9 +54,10 @@ func emitEvent(m map[string]any) {
 	}
 }
 
-// shouldEmitOpen 过滤唯一例外：pass/tls_direct 只走 stats 计数，不进流。
+// shouldEmitOpen 过滤唯一例外：reason=tls_direct（全端口标准 TLS 直通，体量最大）
+// 只走 stats 计数，不进流。
 func shouldEmitOpen(verdict, reason string) bool {
-	return !(verdict == "pass" && reason == "tls_direct")
+	return reason != "tls_direct"
 }
 
 func emitOpen(proto, src string, od dstAddr, verdict, reason string) {

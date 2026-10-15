@@ -29,7 +29,7 @@ func TestEventsErrorLine(t *testing.T) {
 		t.Fatalf("error missing detail: %v", m)
 	}
 	// reason 冻结：classify 行为不受事件流影响（抽查）。
-	if v, r := classify(dstAddr{port: 8081}, msfPkt(1403, 100)); v != "proxy" || r != "msf" {
+	if v, r := classify(dstAddr{port: 8081}, []byte{0x05, 0x7b, 0x08, 0x00, 0x01}); v != "proxy" || r != "default" {
 		t.Fatalf("classify frozen: got %s/%s", v, r)
 	}
 }

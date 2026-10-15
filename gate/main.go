@@ -1,26 +1,13 @@
 package main
 
-// wxdet-gate —— 旁路网关的前置分流门（TCP :12347 + UDP :12348）。
-//
-// nftables 把受管网段的 TCP 重定向（以及 STUN / UDP 80 / UDP 8080 的 DNAT）到本进程；
-// 本进程 peek 客户端首包，按协议指纹与明文特征把连接分成四类：
-//
-//	verdict=proxy  必须走代理：拨到下游的敏感/加密入口；失败不回退直连。
-//	verdict=pass   转交下游：拨到下游的普通入口，由下游自行决定路由。
-//	verdict=block  政策阻断（加密 DNS 等），直接断流。
-//	verdict=direct 仅 UDP：直连回源（非 STUN 残渣）。
-//
-// 设计取向：会被厂商私有协议/明文特征直接识别为“多设备”的流量，宁绕路不漏放；
-// 其余流量转交下游入口精细分流，保证吞吐与体验。gate 只做判决，不指定下游软件。
 import (
-	"encoding/binary"
+	"bytes"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,24 +17,18 @@ import (
 
 const soOriginalDst = 80
 
-// defProxySocks = 下游敏感/加密入口（SOCKS5）；gate 判 proxy 的流量经它进入下游。
-// 示例默认指向本机 127.0.0.1:10811，可用 WD_PROXY_SOCKS 覆盖为任意代理入口。
+// defProxySocks = 下游代理的 socks 入站；gate 判 proxy 的流量经它进入代理，由代理侧做故障转移。
 const defProxySocks = "127.0.0.1:10811"
 
 var (
 	listenAddr  = envStr("WD_LISTEN", "0.0.0.0:12347")
-	passSocks   = envStr("WD_PASS_SOCKS", "127.0.0.1:10808")
+	passSocks   = envStr("WD_PASS_SOCKS", "127.0.0.1:18081")
 	proxySocks  = envStr("WD_PROXY_SOCKS", defProxySocks)
-	kwPath      = envStr("WD_KW_FILE", "/etc/wxdet/gate.kw")
 	gateLogPath = envStr("WD_LOG", "/tmp/wxdet/gate.log")
 	statsPath   = envStr("WD_STATS", "/tmp/wxdet/stats.tsv")
 	peekWait    = time.Duration(envInt("WD_PEEK_MS", 400)) * time.Millisecond
 	peekWait80  = time.Duration(envInt("WD_PEEK80_MS", 80)) * time.Millisecond
 	kwPollSec   = envInt("WD_KW_POLL_SEC", 30)
-	kws         atomic.Value // stores []string；热加载时原子替换，读无锁
-	kwMu        sync.Mutex
-	kwModTime   time.Time
-	kwSize      int64
 	statFile    *os.File
 	gateLogFile *os.File
 	ioMu        sync.Mutex
@@ -81,11 +62,8 @@ func (d dstAddr) String() string {
 
 func main() {
 	log.SetFlags(log.LstdFlags)
-	nkw := loadKeywords()
-	ndoh, nip := loadDohLists()
-	log.Printf("doh lists: dom=%d ip=%d", ndoh, nip)
-	ndl, nua, next, nbsf := loadDLLists()
-	log.Printf("dl lists: dom=%d ua=%d ext=%d bsf=%d", ndl, nua, next, nbsf)
+	ndl, nua, next, nq := loadDLLists()
+	log.Printf("dl lists: dom=%d ua=%d ext=%d query=%d", ndl, nua, next, nq)
 	os.MkdirAll(filepath.Dir(gateLogPath), 0755)
 	var err error
 	statFile, err = os.OpenFile(statsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -102,8 +80,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", listenAddr, err)
 	}
-	log.Printf("wxdet-gate listening on %s (passSocks=%s proxySocks=%s kws=%d peek=%s)", listenAddr, passSocks, proxySocks, nkw, peekWait)
-	go watchKeywords()
+	log.Printf("wxdet-gate listening on %s (proxy=%s pass=%s peek=%s)", listenAddr, proxySocks, passSocks, peekWait)
+	go watchDLLists()
 	if udpListenAddr != "" && udpListenAddr != "off" {
 		go serveUDP()
 	}
@@ -130,17 +108,48 @@ func writeStat(key string, val int) {
 	ioMu.Unlock()
 }
 
-func logGate(src string, od dstAddr, verdict, reason string, b []byte) {
+func logGate(proto, src string, od dstAddr, verdict, reason string, b []byte) {
 	if gateLogFile == nil {
 		return
 	}
-	hex := fmt.Sprintf("%x", b)
+	// P2-8：只渲染要落盘的 24B（旧版先对整段 1024B Sprintf 再截断，白烧 CPU/GC）。
+	hx := b
+	if len(hx) > 24 {
+		hx = hx[:24]
+	}
+	hex := fmt.Sprintf("%x", hx)
 	if len(b) > 24 {
-		hex = fmt.Sprintf("%x", b[:24]) + ".."
+		hex += ".."
 	}
 	ioMu.Lock()
-	fmt.Fprintf(gateLogFile, "{\"ts\":%d,\"src\":%q,\"dst\":%q,\"verdict\":%q,\"reason\":%q,\"first\":%q}\n",
-		time.Now().Unix(), src, od.String(), verdict, reason, hex)
+	fmt.Fprintf(gateLogFile, "{\"ts\":%d,\"proto\":%q,\"src\":%q,\"dst\":%q,\"verdict\":%q,\"reason\":%q,\"first\":%q}\n",
+		time.Now().Unix(), proto, src, od.String(), verdict, reason, hex)
+	ioMu.Unlock()
+}
+
+// logGateErr err 行专用：比 logGate 多一个截断到 64B 的 detail（拨号失败原因等）。
+// 背景：proxy burst / pass i/o timeout 这类根因以前只在 events（detail 全量）与 logd stderr 里
+// 看得到，gate.log 的 err 行只有 reason+首包 hex，tail gate.log 定位不到原因。
+func logGateErr(proto, src string, od dstAddr, verdict, reason, detail string, b []byte) {
+	if len(detail) > 64 {
+		detail = detail[:64] + ".."
+	}
+	// detail 复用 logGate 的落盘锁与格式：先记尸检行，再由调用方补事件。
+	saved := gateLogFile
+	if saved == nil {
+		return
+	}
+	hx := b
+	if len(hx) > 24 {
+		hx = hx[:24]
+	}
+	hex := fmt.Sprintf("%x", hx)
+	if len(b) > 24 {
+		hex += ".."
+	}
+	ioMu.Lock()
+	fmt.Fprintf(saved, "{\"ts\":%d,\"proto\":%q,\"src\":%q,\"dst\":%q,\"verdict\":%q,\"reason\":%q,\"detail\":%q,\"first\":%q}\n",
+		time.Now().Unix(), proto, src, od.String(), verdict, reason, detail, hex)
 	ioMu.Unlock()
 }
 
@@ -164,15 +173,24 @@ func shouldPeekMore(b0 byte) bool {
 }
 
 // peekClient 阻塞读客户端首包（最多 len(buf)，返回字节数；调用后清 deadline）。
-// :80 用 opportunistic 短读（peekWait80，默认 80ms）——HTTP 客户端建连即发
-// 请求，局域网内数据必在途，读到即走正常 classify（dl_direct/bsf_direct/
-// http_plain 可达）；静默/超时/空/非 HTTP 则 n=0 落 proxy/port80（fail-closed）。
+// R8：:80 用 opportunistic 短读（peekWait80，默认 80ms）——HTTP 客户端建连即发
+// 请求，局域网内数据必在途，读到即走正常 classify（dl_direct/dl_range/dl_ua/
+// dl_ext 可达）；静默/超时/空/非 HTTP 则 n=0 落 proxy/default（fail-closed）。
 // 443/奇端口沿用 peekWait（要载荷做 TLS/HTTP 判定，省不掉）。
-func peekClient(c net.Conn, buf []byte, port int) int {
-	wait := peekWait
+// 0x16 开头但首读不足 6B 时在同一 150ms 预算内续读到 6B（TLS 严判需
+// 16 03 … 01 六字节）；b[1]==0xF1（mmtls）即早停，字节收集行为保持原样。
+// peekBudget 首包 peek 时间预算：:80 用 opportunistic 短读（R8，peekWait80），
+// 其余端口全量 peek（peekWait，要载荷做 TLS/HTTP 判定）。P1-2 的 TLS 续读
+// 复用同一预算（绝对 deadline），不新增等待层级。
+func peekBudget(port int) time.Duration {
 	if port == 80 {
-		wait = peekWait80
+		return peekWait80
 	}
+	return peekWait
+}
+
+func peekClient(c net.Conn, buf []byte, port int) int {
+	wait := peekBudget(port)
 	c.SetReadDeadline(time.Now().Add(wait))
 	defer c.SetReadDeadline(time.Time{})
 	n := 0
@@ -184,100 +202,29 @@ func peekClient(c net.Conn, buf []byte, port int) int {
 				n += k
 			}
 		}
+		if port != 80 && n >= 2 && n < 6 && buf[0] == 0x16 && buf[1] != 0xF1 {
+			// 短读补齐：TLS 严判需 6 字节（16 03 … 01），首读 2-5 字节时在同一
+			// 150ms 预算内续读。b[1]==0xF1 即早停——字节收集早停不变；判路无 mmtls/oicq
+			// reason，一律三判。
+			dl := time.Now().Add(150 * time.Millisecond)
+			for n < 6 && time.Now().Before(dl) {
+				c.SetReadDeadline(dl)
+				if k, _ := c.Read(buf[n:]); k > 0 {
+					n += k
+				} else {
+					break
+				}
+			}
+		}
 	} else if err != nil && !isTimeout(err) {
 		// client closed without data; fall through with n=0 (default path)
 	}
 	return n
 }
 
-// DoH 服务端域名正则（2026-09 实测名单）：覆盖 Google/Cloudflare/阿里/DNSPod/360
-// 及通用加密 DNS 命名（dns./doh./dot. 前缀、-dns 后缀、alidns 等），边界限定避免
-// 误伤（如 madnson、dnspod.cn 主站、ddns 动态域名均不命中）。
-var dohSNIRe = regexp.MustCompile(`(?i)(^|\.)(dns|doh|dot)[.-]|cloudflare-dns|alidns|dns\.google|google-public-dns|doh\.pub|dot\.pub|dns\.pub|doh\.360|dot\.360|quad9|opendns|dns-over-https|securedns|one\.one\.one\.one|1dot1dot1dot1|dns64`)
-
-// proxy 端点记忆（静默复用连接收敛）：已实锤 proxy 的非 80 (ip:port)
-// 在 peek 为空时复用原 reason 判 proxy；未知端点仍 default fail-open。
-// 只记不阻：proxy 出口可达时流量照走，仅绕路不断流；TTL 12h，cap 2048。
-var (
-	proxyMemMu  sync.Mutex
-	proxyMem    = map[string]proxyMemEnt{}
-	proxyMemCap = 2048
-	proxyMemTTL = int64(12 * 3600)
-)
-
-type proxyMemEnt struct {
-	reason string
-	ts     int64
-}
-
-func proxyMemKey(od dstAddr) string { return od.ip.String() + ":" + strconv.Itoa(od.port) }
-
-func proxyMemStore(od dstAddr, reason string) {
-	if od.port == 80 {
-		return // :80 静默本就 port80 fail-closed，不占记忆
-	}
-	now := time.Now().Unix()
-	proxyMemMu.Lock()
-	defer proxyMemMu.Unlock()
-	if len(proxyMem) >= proxyMemCap {
-		for k, e := range proxyMem {
-			if now-e.ts > proxyMemTTL {
-				delete(proxyMem, k)
-			}
-		}
-		if len(proxyMem) >= proxyMemCap {
-			proxyMem = map[string]proxyMemEnt{}
-		}
-	}
-	proxyMem[proxyMemKey(od)] = proxyMemEnt{reason: reason, ts: now}
-}
-
-func proxyMemLookup(od dstAddr) (string, bool) {
-	proxyMemMu.Lock()
-	defer proxyMemMu.Unlock()
-	e, ok := proxyMem[proxyMemKey(od)]
-	if !ok {
-		return "", false
-	}
-	if time.Now().Unix()-e.ts > proxyMemTTL {
-		delete(proxyMem, proxyMemKey(od))
-		return "", false
-	}
-	return e.reason, true
-}
-
-// 公网解析器 IP：443 打到这些即 IP 字面 DoH。
-var dnsResolverIPs = map[string]bool{
-	"223.5.5.5": true, "223.6.6.6": true, "119.29.29.29": true,
-	"1.12.12.12": true, "120.53.53.53": true, "180.76.76.76": true,
-	"114.114.114.114": true, "114.114.115.115": true,
-	"101.226.4.6": true, "218.30.118.6": true, "123.125.81.6": true, "140.207.198.6": true,
-	"8.8.8.8": true, "8.8.4.4": true, "1.1.1.1": true, "1.0.0.1": true,
-	"9.9.9.9": true, "208.67.222.222": true, "208.67.220.220": true,
-}
-
-// DoH 封堵名单（dibdot 全量 + Sekhan，去重 1923 域 / 3514 IP，热加载）：
-// 域名精确或子域后缀命中，IP 精确命中。单文件缺失保留旧快照；IP 以内置种子为基线只增不减。
-var (
-	dohDomPath = envStr("WD_DOH_DOM_FILE", "/etc/wxdet/doh-domains.txt")
-	dohIPPath  = envStr("WD_DOH_IP_FILE", "/etc/wxdet/doh-ips.txt")
-	dohDoms    atomic.Value // map[string]bool
-	dohIPs     atomic.Value // map[string]bool
-	dohMu      sync.Mutex
-	dohMarks   = map[string]fileMark{}
-)
-
 type fileMark struct {
 	mod  time.Time
 	size int64
-}
-
-func init() {
-	seed := map[string]bool{}
-	for k := range dnsResolverIPs {
-		seed[k] = true
-	}
-	dohIPs.Store(seed)
 }
 
 func parseLineSet(b []byte) map[string]bool {
@@ -296,22 +243,8 @@ func parseLineSet(b []byte) map[string]bool {
 	return m
 }
 
-func dohDomSnapshot() map[string]bool {
-	if v := dohDoms.Load(); v != nil {
-		return v.(map[string]bool)
-	}
-	return nil
-}
-
-func dohIPSnapshot() map[string]bool {
-	if v := dohIPs.Load(); v != nil {
-		return v.(map[string]bool)
-	}
-	return nil
-}
-
-// matchDohDomain 精确或子域后缀命中（可单测）。
-func matchDohDomain(sni string, set map[string]bool) bool {
+// matchDomainSuffix 精确或子域后缀命中（dl-domains 用，可单测）。
+func matchDomainSuffix(sni string, set map[string]bool) bool {
 	s := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(sni), "."))
 	if s == "" {
 		return false
@@ -327,99 +260,26 @@ func matchDohDomain(sni string, set map[string]bool) bool {
 	return false
 }
 
-func dohDomainHit(sni string) bool { return matchDohDomain(sni, dohDomSnapshot()) }
-func dohIPHit(ip string) bool      { return dohIPSnapshot()[ip] }
-
-func noteDohMark(path string) {
-	if fi, err := os.Stat(path); err == nil {
-		dohMu.Lock()
-		dohMarks[path] = fileMark{mod: fi.ModTime(), size: fi.Size()}
-		dohMu.Unlock()
-	}
-}
-
-// loadDohLists 读域名/IP 名单并原子替换（IP 合并内置种子；单文件缺失保留旧快照）。
-func loadDohLists() (nd, ni int) {
-	if b, err := os.ReadFile(dohDomPath); err == nil {
-		m := parseLineSet(b)
-		dohDoms.Store(m)
-		nd = len(m)
-		noteDohMark(dohDomPath)
-	} else {
-		log.Printf("warn: doh dom file %s: %v", dohDomPath, err)
-	}
-	m := map[string]bool{}
-	for k := range dnsResolverIPs {
-		m[k] = true
-	}
-	if b, err := os.ReadFile(dohIPPath); err == nil {
-		for k := range parseLineSet(b) {
-			m[k] = true
-		}
-		noteDohMark(dohIPPath)
-	} else {
-		log.Printf("warn: doh ip file %s: %v", dohIPPath, err)
-	}
-	dohIPs.Store(m)
-	ni = len(m)
-	return nd, ni
-}
-
-func checkDohReload() bool {
-	changed := false
-	dohMu.Lock()
-	for _, p := range []string{dohDomPath, dohIPPath} {
-		if fi, err := os.Stat(p); err == nil {
-			if mk, ok := dohMarks[p]; !ok || fi.ModTime().After(mk.mod) || fi.Size() != mk.size {
-				changed = true
-			}
-		}
-	}
-	dohMu.Unlock()
-	if !changed {
-		return false
-	}
-	nd, ni := loadDohLists()
-	log.Printf("doh reloaded: dom=%d ip=%d", nd, ni)
-	writeStat("gate_doh_reload", 1)
-	return true
-}
-
-// 下载站/下载器/BSF 名单（30s 热加载，见 lists/）：
-// dl-domains 精确/子域匹配记 pass/dl_direct；dl-ua 为 UA token 子串匹配记
-// pass/dl_ua；dl-ext 为 URL 后缀匹配记 pass/dl_ext；bsf-domains 精确/子域匹配
-// 记 pass/bsf_direct。单文件缺失保留旧快照。
+// 下载站/下载器名单（30s 热加载，lists/ 镜像）：
+// dl-domains 精确/子域匹配记 direct/dl_direct；dl-ua 为 UA token 子串匹配记
+// pass/dl_ua；dl-ext 为 URL 后缀匹配记 pass/dl_ext；dl-query 为 URL query
+// 预签名/强制下载参数子串匹配记 pass/dl_query（不依赖 Host 名单的新增召回）。
+// 单文件缺失保留旧快照。
 var (
-	dlDomPath  = envStr("WD_DL_DOM_FILE", "/etc/wxdet/dl-domains.txt")
-	dlUAPath   = envStr("WD_DL_UA_FILE", "/etc/wxdet/dl-ua.txt")
-	dlExtPath  = envStr("WD_DL_EXT_FILE", "/etc/wxdet/dl-ext.txt")
-	bsfDomPath = envStr("WD_BSF_DOM_FILE", "/etc/wxdet/bsf-domains.txt")
-	dlDoms     atomic.Value // map[string]bool
-	dlUAs      atomic.Value // []string
-	dlExts     atomic.Value // []string
-	bsfDoms    atomic.Value // map[string]bool
-	dlMu       sync.Mutex
-	dlMarks    = map[string]fileMark{}
+	dlDomPath   = envStr("WD_DL_DOM_FILE", "/etc/wxdet/dl-domains.txt")
+	dlUAPath    = envStr("WD_DL_UA_FILE", "/etc/wxdet/dl-ua.txt")
+	dlExtPath   = envStr("WD_DL_EXT_FILE", "/etc/wxdet/dl-ext.txt")
+	dlQueryPath = envStr("WD_DL_QUERY_FILE", "/etc/wxdet/dl-query.txt")
+	dlDoms      atomic.Value // map[string]bool
+	dlUAs       atomic.Value // []string
+	dlExts      atomic.Value // []string
+	dlQuerys    atomic.Value // []string
+	dlMu        sync.Mutex
+	dlMarks     = map[string]fileMark{}
 )
-
-// 逃生文件：存在即明文通判（http_plain）+ 80 短路（port80）全部回退 pass
-// （reason 拼写不变，只换 verdict）；关键词/下载站/BSF/下载器特征规则照旧。
-var noPlainProxyPath = envStr("WD_NO_PLAINHTTP_PROXY", "/etc/wxdet/no-plainhttp-proxy")
-
-func noPlainProxy() bool {
-	_, err := os.Stat(noPlainProxyPath)
-	return err == nil
-}
 
 func dlDomSnapshot() map[string]bool {
 	if v := dlDoms.Load(); v != nil {
-		return v.(map[string]bool)
-	}
-	return nil
-}
-
-func bsfDomSnapshot() map[string]bool {
-	if v := bsfDoms.Load(); v != nil {
 		return v.(map[string]bool)
 	}
 	return nil
@@ -439,8 +299,14 @@ func dlExtSnapshot() []string {
 	return nil
 }
 
-func dlDomainHit(host string) bool  { return matchDohDomain(host, dlDomSnapshot()) }
-func bsfDomainHit(host string) bool { return matchDohDomain(host, bsfDomSnapshot()) }
+func dlQuerySnapshot() []string {
+	if v := dlQuerys.Load(); v != nil {
+		return v.([]string)
+	}
+	return nil
+}
+
+func dlDomainHit(host string) bool { return matchDomainSuffix(host, dlDomSnapshot()) }
 
 // dlUAHit 下载器 UA token 子串命中（大小写不敏感）。
 func dlUAHit(ua string) bool {
@@ -484,7 +350,7 @@ func noteDLMark(path string) {
 }
 
 // loadDLLists 读四个名单并原子替换（单文件缺失保留旧快照）。
-func loadDLLists() (nd, nu, ne, nb int) {
+func loadDLLists() (nd, nu, ne, nq int) {
 	if b, err := os.ReadFile(dlDomPath); err == nil {
 		m := parseLineSet(b)
 		dlDoms.Store(m)
@@ -509,21 +375,21 @@ func loadDLLists() (nd, nu, ne, nb int) {
 	} else {
 		log.Printf("warn: dl ext file %s: %v", dlExtPath, err)
 	}
-	if b, err := os.ReadFile(bsfDomPath); err == nil {
-		m := parseLineSet(b)
-		bsfDoms.Store(m)
-		nb = len(m)
-		noteDLMark(bsfDomPath)
+	if b, err := os.ReadFile(dlQueryPath); err == nil {
+		list := parseKeywords(b)
+		dlQuerys.Store(list)
+		nq = len(list)
+		noteDLMark(dlQueryPath)
 	} else {
-		log.Printf("warn: bsf dom file %s: %v", bsfDomPath, err)
+		log.Printf("warn: dl query file %s: %v", dlQueryPath, err)
 	}
-	return nd, nu, ne, nb
+	return nd, nu, ne, nq
 }
 
 func checkDLReload() bool {
 	changed := false
 	dlMu.Lock()
-	for _, p := range []string{dlDomPath, dlUAPath, dlExtPath, bsfDomPath} {
+	for _, p := range []string{dlDomPath, dlUAPath, dlExtPath, dlQueryPath} {
 		if fi, err := os.Stat(p); err == nil {
 			if mk, ok := dlMarks[p]; !ok || fi.ModTime().After(mk.mod) || fi.Size() != mk.size {
 				changed = true
@@ -534,170 +400,90 @@ func checkDLReload() bool {
 	if !changed {
 		return false
 	}
-	nd, nu, ne, nb := loadDLLists()
-	log.Printf("dl reloaded: dom=%d ua=%d ext=%d bsf=%d", nd, nu, ne, nb)
+	nd, nu, ne, nq := loadDLLists()
+	log.Printf("dl reloaded: dom=%d ua=%d ext=%d query=%d", nd, nu, ne, nq)
 	writeStat("gate_dl_reload", 1)
 	return true
 }
 
-func classify(od dstAddr, b []byte) (string, string) {
-	// DoH-IP 直连封堵：HTTPS(443) 打到名单 IP 即 DoH（IP 字面，无 SNI 可看）。名单=文件+内置种子。
-	if od.port == 443 && dohIPHit(od.ip.String()) {
-		return "block", "dns_block"
-	}
-	if len(b) >= 2 && b[1] == 0xF1 {
-		switch b[0] {
-		case 0x15, 0x16, 0x17, 0x19:
-			return "proxy", "mmtls"
-		}
-	}
-	if len(b) >= 1 && b[0] == 0x02 {
-		return "proxy", "oicq"
-	}
-	if len(b) >= 8 && b[2] == 0x08 && b[3] == 0x00 &&
-		(b[4] == 0x06 || b[4] == 0x07 || b[4] == 0x08) && b[5] == 0x06 && b[6] == 0x07 && b[7] == 0x62 {
-		// MSF/Beacon framing（全端口）：u16be 首部为包长自描述，08 00 为 OICQ
-		// 08xx 命令族，XX 06 07 62 为同族常量（XX∈{06,07,08} 三值等价）。
-		// peek 最多截前 1024B，大包恒被截断，故用 decl>=len(b) 而非相等；
-		// 6 固定字节 + 长度自洽，碰撞≈0。
-		if decl := int(binary.BigEndian.Uint16(b[0:2])); decl >= len(b) {
-			return "proxy", "msf"
-		}
-	}
-	if len(b) >= 20 && b[2] == 0x08 && b[3] == 0x00 &&
-		string(b[7:20]) == "TYPE_COMPRESS" {
-		// MSF 家族 TYPE_COMPRESS 变种（全端口）：QQ Beacon 上报的一种帧形态，
-		// 08 00 命令族 + offset 7 起 13 字节 ASCII 魔串 + 同款 decl>=len 自洽。
-		if decl := int(binary.BigEndian.Uint16(b[0:2])); decl >= len(b) {
-			return "proxy", "msf"
-		}
-	}
-	if len(b) >= 16 && b[4] == 0x01 &&
-		b[5] == 0x33 && b[6] == 0x52 && b[7] == 0x39 &&
-		b[8] == 0x00 && b[9] == 0x00 && b[10] == 0x00 && b[11] == 0x00 &&
-		b[12] == 0x04 && string(b[13:16]) == "MSF" {
-		// MSF 家族 u32be 变种（全端口）：u32be 包长 + 01 33 52 39 + u32be 0 +
-		// 04 "MSF"。实测 QQ 在 443/8080/14000 用此帧头（u16be 分支恒 miss，
-		// 会全部漏过）。u32 decl 语义不明（21 vs peek 长度对不上），故不用
-		// decl 自洽，纯靠 12 固定字节（≈96bit）定性，碰撞可忽略。
-		return "proxy", "msf"
-	}
-	if len(b) >= 8 && b[0] == 0x00 && b[1] == 0x00 && b[2] == 0x00 &&
-		b[4] == 0x00 && b[5] == 0x00 && b[6] == 0x00 && b[7] == 0xc8 {
-		// MSF 家族全零头变种（全端口）：实测 QQ 在 8080 用此帧头
-		//（00 00 00 1a/20 00 00 00 c8，疑似 TLV：len + type=200），
-		// u16be/u32be/TYPE_COMPRESS 分支均 miss 会漏过。
-		// 7 固定字节（≈56bit）定性，碰撞可忽略。
-		return "proxy", "msf"
-	}
-	if len(b) >= 8 && b[0] == 0x08 && b[2] == 0x08 && b[3] == 0x00 &&
-		b[4] == 0x07 && b[5] == 0x06 && b[6] == 0x0c && b[7] == 0x73 {
-		// MSF 家族 0806 变种（全端口）：实测腾讯游戏鉴权在 8081 用此帧头
-		//（08 XX 08 00 07 06 0c 73，XX 随包变化）。
-		// 与 u16be 分支仅 b[6]/b[7] 之差（0c 73 vs 07 62），独立分支精确
-		// 匹配。b[0] 为常量 0x08 而非长度字节，故不用 decl 自洽，
-		// 纯靠 7 固定字节（≈56bit）定性，碰撞可忽略。
-		return "proxy", "msf"
-	}
-	if len(b) >= 12 && b[2] == 0x00 && b[3] == 0x01 &&
-		b[6] == 0x21 && b[7] == 0x12 && b[8] == 0xa4 && b[9] == 0x42 {
-		// STUN-over-TCP 媒体腿（全端口）：u16be 首部为后随长度（2 字节前缀），
-		// 00 01 为 Binding Request，21 12 a4 42 为 STUN magic cookie。
-		// 微信视频/直播（tlivesource 信令配套）实测；注意非腾讯 App 的 TCP STUN
-		// 也会命中，误伤代价仅为绕路（proxy 出口仍可达），上线后看 stun verdict
-		// 的目的分布复核。
-		decl := int(binary.BigEndian.Uint16(b[0:2]))
-		stunLen := int(binary.BigEndian.Uint16(b[4:6]))
-		if decl == 20+stunLen && decl+2 >= len(b) {
-			return "proxy", "stun"
-		}
-	}
-	if len(b) >= 6 && b[0] == 0x16 && b[1] == 0x03 {
-		if sni := tlsSNI(b); sni != "" {
-			// DoH 域名封堵（政策）：名单精确/子域命中即丢；未知模式再走正则兜底。
-			if dohDomainHit(sni) {
-				return "block", "dns_block"
-			}
-			// 未知加密 DNS 模式走正则兜底。
-			if dohSNIRe.MatchString(sni) {
-				return "block", "dns_block"
-			}
-		}
-		// TLS 全端口转交：非 DoH 的 TLS 一律 pass/tls_direct（转交下游入口）；
-		// 手机 App 基本不用 h2c，TLS 误判不考虑。
-		return "pass", "tls_direct"
-	}
-	// 判定顺序：下载站 Host（pass/dl_direct，bulk 优先于关键词）→ UA/HTTP
-	// 关键词（腾讯身份优先于下载器特征：aweme 等命中即 proxy，短视频流不因
-	// .flv 后缀被 dl_ext 抢走）→ 下载器特征 dl_range → dl_ua → dl_ext →
-	// BSF Host（pass/bsf_direct，http_plain 之前）→ 明文通判 http_plain →
-	// 80 短路 port80 → pass/default。
-	isH := isHTTPRequest(b)
-	if isH {
-		if h := httpHost(b); h != "" && dlDomainHit(h) {
-			return "pass", "dl_direct"
-		}
-	}
-	// UA 头匹配（全端口，不受 80/8080 门限约束）：UA 是客户端自报身份，
-	// 包名级 token（aweme/MicroMessenger）误报≈0，专治 Host 为 IP 的形态。
-	if ua := httpUserAgent(b); ua != "" && kwMatch(ua) {
-		return "proxy", "http_ua_kw"
-	}
-	// 明文 HTTP 关键词（全端口，不设端口门）：方法行语义校验挡随机二进制。
-	// fail-closed（守门员策略）：识别到的包只许进 proxy，proxy 不通即断流，
-	// 绝不回退 pass。宁断不错放。
-	if r := httpKeyword(b); r != "" {
-		return "proxy", r
-	}
-	if isH {
-		// 下载器特征三层（请求侧信号；响应侧 206/Content-Length gate 看不到，
-		// 不做）：Range 头（多线程/断点续传/seek 最强信号）→ 下载器 UA →
-		// 二进制/媒体 URL 后缀。Range/UA/后缀一般在首包前 600B 内，超长
-		// Cookie 挤出 1024B peek 窗则 miss，安全落回 http_plain 进 proxy。
-		if hasRangeHeader(b) {
-			return "pass", "dl_range"
-		}
-		if ua := httpUserAgent(b); ua != "" && dlUAHit(ua) {
-			return "pass", "dl_ua"
-		}
-		if p := httpPath(b); p != "" && dlExtHit(p) {
-			return "pass", "dl_ext"
-		}
-		// BSF 运营商信令 direct-by-policy（http_plain 之前，不随逃生回滚）。
-		if h := httpHost(b); h != "" && bsfDomainHit(h) {
-			return "pass", "bsf_direct"
-		}
-		// 明文 HTTP 通判：方法行合法、无关键词、非下载站/BSF。逃生文件存在
-		// 即回退 pass（reason 拼写不变）。
-		if noPlainProxy() {
-			return "pass", "http_plain"
-		}
-		return "proxy", "http_plain"
-	}
-	// 80 短路（fail-closed）：80 非 HTTP/空载荷无条件进 proxy；逃生回退 pass。
-	if od.port == 80 {
-		if noPlainProxy() {
-			return "pass", "port80"
-		}
-		return "proxy", "port80"
-	}
-	// 8000-9000 兜底：魔数/TLS/关键词/下载特征已在上游返回，
-	// 落到这里的非 TLS 私有协议残渣一律 proxy（fail-closed，无视逃生文件，
-	// reason 复用 default 以保持 reason 字符串稳定）。
-	if od.port >= 8000 && od.port <= 9000 {
-		return "proxy", "default"
-	}
-	return "pass", "default"
+// looksLikeTLSRecord：旧粗判（16 03 前缀 + ≥6B）。保留仅用于观测对照：
+// 命中本判但未过 isTLSClientHello 的连接计入 gate_tls_strict_fail。
+func looksLikeTLSRecord(b []byte) bool {
+	return len(b) >= 6 && b[0] == 0x16 && b[1] == 0x03
 }
 
-func kwMatch(s string) bool {
-	s = strings.ToLower(s)
-	for _, kw := range kwSnapshot() {
-		if kw != "" && strings.Contains(s, kw) {
-			return true
+// isTLSClientHello：严判（对齐 Zeek/Suricata 系解析器口径）。
+// 在 16 03 前缀基础上要求：
+//   - b[2] 记录层版本 minor ∈ {0x00..0x03}（Zeek 记录层白名单 / Suricata 客户端模式）；
+//   - b[3:5] 记录长度 ∈ [1, 16384+2048]（tls-parser MAX_RECORD_LEN 上限；下限 1 =
+//     允许记录级分片的首记录只有 1-3B 负载，空记录拒绝）；
+//   - b[5] 握手类型 == 0x01（客户端首包只可能是 ClientHello）。
+//
+// 使"16 03 开头的任意二进制（如 u16be 长度前缀 0x1603）"不再判成 TLS：
+// 误判率由 ~1 降到 ~1/(256×64)≈6e-5/连接。
+func isTLSClientHello(b []byte) bool {
+	if !looksLikeTLSRecord(b) {
+		return false
+	}
+	if b[2] > 0x03 {
+		return false
+	}
+	if rl := int(b[3])<<8 | int(b[4]); rl < 1 || rl > 18432 {
+		return false
+	}
+	return b[5] == 0x01
+}
+
+// classify 生产入口：与原版逐字节一致，仅在严判失败时落 gate_tls_strict_fail（P2-12：
+// 判路本体拆成无副作用的 classifyEx，单测不再写文件）。
+func classify(od dstAddr, b []byte) (string, string) {
+	v, r, strictFail := classifyEx(od, b)
+	if strictFail {
+		writeStat("gate_tls_strict_fail", 1)
+	}
+	if r == "dl_range" {
+		// Range 强弱只做观测分级（gate_range_strong/weak），不改判路：
+		// 弱 Range 翻转会降召回（视频 seek 进代理烧带宽），等计数说话再定。
+		if rangeStrong(b) {
+			writeStat("gate_range_strong", 1)
+		} else {
+			writeStat("gate_range_weak", 1)
 		}
 	}
-	return false
+	return v, r
+}
+
+// classifyEx 纯判路（无副作用）。三判：标准 TLS → pass；明文 HTTP 下载特征
+// （Host 名单 > Range > URL query 签名 > 下载器 UA > 后缀）→ pass；其余一切 → proxy/default。
+// strictFail = 旧粗判(16 03)真、严判假，由 classify 计数（纯观测，不改判路）。
+// 注意顺序：Range 在前保既有 dl_range 标签稳定（query 只收无 Range 的单 GET 下载链）。
+// strictFail = 旧粗判(16 03)真、严判假，由 classify 计数（纯观测，不改判路）。
+func classifyEx(od dstAddr, b []byte) (verdict, reason string, strictFail bool) {
+	_ = od // 判路端口无关（peek 预算仍按端口，见 peekBudget）
+	if isTLSClientHello(b) {
+		return "pass", "tls_direct", false
+	}
+	if looksLikeTLSRecord(b) {
+		strictFail = true
+	}
+	if isHTTPRequest(b) {
+		if h := httpHost(b); h != "" && dlDomainHit(h) {
+			return "pass", "dl_direct", strictFail
+		}
+		if hasRangeHeader(b) {
+			return "pass", "dl_range", strictFail
+		}
+		if p := httpPath(b); p != "" && dlQueryHit(p) {
+			return "pass", "dl_query", strictFail
+		}
+		if ua := httpUserAgent(b); ua != "" && dlUAHit(ua) {
+			return "pass", "dl_ua", strictFail
+		}
+		if p := httpPath(b); p != "" && dlExtHit(p) {
+			return "pass", "dl_ext", strictFail
+		}
+	}
+	return "proxy", "default", strictFail
 }
 
 // parseKeywords 解析关键词文件（小写、去空行/# 注释）。
@@ -712,112 +498,20 @@ func parseKeywords(b []byte) []string {
 	return out
 }
 
-func setKeywords(list []string) {
-	kws.Store(list)
-}
-
-func kwSnapshot() []string {
-	if v := kws.Load(); v != nil {
-		return v.([]string)
-	}
-	return nil
-}
-
-// loadKeywords 读取关键词文件并原子替换内存快照，返回条数。
-func loadKeywords() int {
-	b, err := os.ReadFile(kwPath)
-	if err != nil {
-		log.Printf("warn: kw file %s: %v", kwPath, err)
-		return 0
-	}
-	list := parseKeywords(b)
-	setKeywords(list)
-	if fi, serr := os.Stat(kwPath); serr == nil {
-		kwMu.Lock()
-		kwModTime = fi.ModTime()
-		kwSize = fi.Size()
-		kwMu.Unlock()
-	}
-	return len(list)
-}
-
-// checkKwReload 文件 mtime/size 变化则重载，返回是否发生重载（可单测）。
-func checkKwReload() bool {
-	fi, err := os.Stat(kwPath)
-	if err != nil {
-		return false
-	}
-	kwMu.Lock()
-	changed := fi.ModTime().After(kwModTime) || fi.Size() != kwSize
-	kwMu.Unlock()
-	if !changed {
-		return false
-	}
-	n := loadKeywords()
-	log.Printf("kw reloaded: %s (%d keywords)", kwPath, n)
-	writeStat("gate_kw_reload", 1)
-	return true
-}
-
-// watchKeywords 周期性轮询关键词文件（WD_KW_POLL_SEC，<=0 关闭），变化即热加载，不断连接。
-func watchKeywords() {
+// watchDLLists 周期性轮询名单文件（WD_KW_POLL_SEC，<=0 关闭），变化即热加载，不断连接。
+func watchDLLists() {
 	if kwPollSec <= 0 {
 		return
 	}
 	t := time.NewTicker(time.Duration(kwPollSec) * time.Second)
 	defer t.Stop()
 	for range t.C {
-		checkKwReload()
-		checkDohReload()
 		checkDLReload()
 	}
 }
 
-func tlsSNI(b []byte) string {
-	if len(b) < 9 || b[0] != 0x16 || b[1] != 0x03 || b[5] != 0x01 {
-		return ""
-	}
-	p := 9 + 34
-	if len(b) < p+1 {
-		return ""
-	}
-	p += int(b[p]) + 1
-	if len(b) < p+2 {
-		return ""
-	}
-	p += 2 + (int(b[p])<<8 | int(b[p+1]))
-	if len(b) < p+1 {
-		return ""
-	}
-	p += int(b[p]) + 1
-	if len(b) < p+2 {
-		return ""
-	}
-	end := p + 2 + (int(b[p])<<8 | int(b[p+1]))
-	if end > len(b) {
-		end = len(b)
-	}
-	p += 2
-	for p+4 <= end {
-		et := int(b[p])<<8 | int(b[p+1])
-		el := int(b[p+2])<<8 | int(b[p+3])
-		p += 4
-		if p+el > end {
-			break
-		}
-		if et == 0 && el >= 5 {
-			nameLen := int(b[p+3])<<8 | int(b[p+4])
-			if p+5+nameLen <= p+el {
-				return string(b[p+5 : p+5+nameLen])
-			}
-		}
-		p += el
-	}
-	return ""
-}
-
 // httpMethods 方法行语义校验表：h2c 的 PRI * HTTP/2.0 不在表里，会穿过
-// 通判走 pass/default（手机 App 基本不用 h2c，记一笔不修）。
+// 通判走 xray/default（手机 App 基本不用 h2c，记一笔不修）。
 var httpMethods = []string{"GET ", "POST ", "HEAD ", "PUT ", "OPTIONS ", "DELETE ", "PATCH ", "CONNECT "}
 
 // isHTTPRequest 方法行语义校验：首行以标准请求方法开头，挡随机二进制。
@@ -847,9 +541,19 @@ func httpFirstLine(b []byte) string {
 	return strings.TrimSuffix(s, "\r")
 }
 
+// headerBlock 只留 HTTP 头部块（首个 \r\n\r\n 之前）。没有该分隔符就返回整段，
+// 保持"头部还没收全"的现有语义（P1-4：头部类判据只看头部，避免 POST body 里
+// 恰好出现的 "\nRange:"/"\nUser-Agent: Thunder" 把判路翻转）。
+func headerBlock(b []byte) []byte {
+	if i := bytes.Index(b, []byte("\r\n\r\n")); i >= 0 {
+		return b[:i]
+	}
+	return b
+}
+
 // httpHost 提取 Host 头（小写、去端口、去尾点；无头返回 ""，IP 字面原样返回）。
 func httpHost(b []byte) string {
-	lower := strings.ToLower(string(b))
+	lower := strings.ToLower(string(headerBlock(b)))
 	i := strings.Index(lower, "\nhost:")
 	if i < 0 {
 		return ""
@@ -868,16 +572,63 @@ func httpHost(b []byte) string {
 
 // httpPath 提取请求路径（方法行第二段；绝对 URL 原样返回，后缀匹配照常工作）。
 func httpPath(b []byte) string {
-	parts := strings.SplitN(strings.TrimSpace(httpFirstLine(b)), " ", 3)
+	parts := strings.SplitN(strings.TrimSpace(httpFirstLine(headerBlock(b))), " ", 3)
 	if len(parts) < 2 {
 		return ""
 	}
 	return parts[1]
 }
 
+// dlQueryHit URL query 预签名/强制下载参数子串命中（大小写不敏感）。
+// 只收各云互不相同的签名参数名；sign=/token=/expires= 这类登录态通用参数绝不进名单。
+func dlQueryHit(path string) bool {
+	s := strings.ToLower(path)
+	for _, tok := range dlQuerySnapshot() {
+		if tok != "" && strings.Contains(s, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+// rangeStrong Range 值语义分级：多段逗号 / If-Range / 首字节非零即强信号；
+// 单段 bytes=0- 与 bytes=-N 尾段为弱信号。只看头部块（body 里的 Range 不算）。
+func rangeStrong(b []byte) bool {
+	lower := strings.ToLower(string(headerBlock(b)))
+	i := strings.Index(lower, "\nrange:")
+	if i < 0 {
+		return false
+	}
+	rest := lower[i+len("\nrange:"):]
+	if j := strings.IndexByte(rest, '\n'); j >= 0 {
+		rest = rest[:j]
+	}
+	val := strings.TrimSpace(rest)
+	if strings.Contains(val, ",") {
+		return true
+	}
+	if strings.Contains(lower, "\nif-range:") {
+		return true
+	}
+	if k := strings.IndexByte(val, '='); k >= 0 {
+		val = strings.TrimSpace(val[k+1:])
+	}
+	if strings.HasPrefix(val, "-") {
+		return false
+	}
+	digits := ""
+	for _, c := range val {
+		if c < '0' || c > '9' {
+			break
+		}
+		digits += string(c)
+	}
+	return strings.TrimLeft(digits, "0") != ""
+}
+
 // hasRangeHeader 是否带 Range: 头（断点续传/音视频 seek 信号；调用方已保证 isHTTPRequest）。
 func hasRangeHeader(b []byte) bool {
-	return strings.Contains(strings.ToLower(string(b)), "\nrange:")
+	return strings.Contains(strings.ToLower(string(headerBlock(b))), "\nrange:")
 }
 
 // httpUserAgent 提取 HTTP 请求的 User-Agent 头值（小写去首尾空格）。
@@ -889,7 +640,7 @@ func httpUserAgent(b []byte) string {
 	if !isHTTPRequest(b) {
 		return ""
 	}
-	lower := strings.ToLower(string(b))
+	lower := strings.ToLower(string(headerBlock(b)))
 	i := strings.Index(lower, "\nuser-agent:")
 	if i < 0 {
 		return ""
@@ -899,27 +650,6 @@ func httpUserAgent(b []byte) string {
 		rest = rest[:j]
 	}
 	return strings.TrimSpace(rest)
-}
-
-func httpKeyword(b []byte) string {
-	// 关键词专用（通判 http_plain 由 classify 后置步骤处理，不在此返回，
-	// 否则 dl_range/dl_ua/dl_ext/BSF 会被短路）：域名 Host 只判 host kw
-	// （无 kw 返回 ""，由通判接住进 proxy）；IP 字面/无 Host 判首行 path kw。
-	if !isHTTPRequest(b) {
-		return ""
-	}
-	line := httpFirstLine(b)
-	hostOnly := httpHost(b)
-	if hostOnly != "" && net.ParseIP(hostOnly) == nil {
-		if kwMatch(hostOnly) {
-			return "http_host_kw"
-		}
-		return ""
-	}
-	if kwMatch(line) {
-		return "http_path_kw"
-	}
-	return ""
 }
 
 func socks5Dial(proxy string, od dstAddr, bindIP net.IP, bindPort int) (*net.TCPConn, error) {
@@ -963,6 +693,14 @@ func socks5Dial(proxy string, od dstAddr, bindIP net.IP, bindPort int) (*net.TCP
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(tc, hdr); err != nil {
 		return fail(err)
+	}
+	// P2-6：回复头必须 VER=5 / RSV=0（旧版只读 hdr[1]，垃圾首字节会被当成合法 REP=0
+	// 而把完全不是 SOCKS5 的字节流当成功连接转发）。
+	if hdr[0] != 5 {
+		return fail(fmt.Errorf("socks reply ver=%d", hdr[0]))
+	}
+	if hdr[2] != 0 {
+		return fail(fmt.Errorf("socks reply rsv=%d", hdr[2]))
 	}
 	if hdr[1] != 0 {
 		return fail(fmt.Errorf("socks rep=%d", hdr[1]))
@@ -1016,26 +754,25 @@ func relay(a, b *net.TCPConn, src string, od dstAddr, verdict, reason string, st
 	emitCloseEvent("tcp", src, od, verdict, reason, durMs, upB, downB, closer)
 }
 
-// passBindAddr 让发往下游普通入口的连接带上可还原的源地址
-// （127.0.0.<客户端末位>:<客户端源端口>），便于在下游连接日志里关联回原始客户端。
-func passBindAddr(src net.Addr) (net.IP, int) {
-	host, portStr, err := net.SplitHostPort(src.String())
-	if err != nil {
-		return nil, 0
+// isLocalDst 本机/私网/链路本地/未指定目的地址。正常 iot 重定向流的目的恒为公网
+// （nft redirect 规则已排除 10/8、127/8、172.16/12、192.168/16），命中即"直连
+// gate 监听口"的非重定向流量，必须丢（P0-1）。与 UDP 侧 udp.go 的
+// gate_udp_local_drop 同口径，注释见那里的防环说明。
+func isLocalDst(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()
+}
+
+// tcpLocalDropLogNs 本机目的丢弃的 gate.log 限速（纳秒时间戳）：计数每次都记，
+// 日志 5s 最多一行，防端口扫描刷屏。
+var tcpLocalDropLogNs atomic.Int64
+
+func logTCPLocalDrop(src string, od dstAddr) {
+	now := time.Now().UnixNano()
+	last := tcpLocalDropLogNs.Load()
+	if now-last < int64(5*time.Second) || !tcpLocalDropLogNs.CompareAndSwap(last, now) {
+		return
 	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port <= 0 {
-		return nil, 0
-	}
-	ip := net.ParseIP(host).To4()
-	if ip == nil || ip[0] != 192 || ip[1] != 168 {
-		return nil, 0
-	}
-	last := int(ip[3])
-	if last < 2 || last > 254 {
-		return nil, 0
-	}
-	return net.IPv4(127, 0, 0, byte(last)), port
+	logGate("tcp", src, od, "drop", "local_dst", nil)
 }
 
 func handleConn(raw net.Conn) {
@@ -1054,53 +791,23 @@ func handleConn(raw net.Conn) {
 		log.Printf("#%d %s origdst: %v", id, src, err)
 		return
 	}
+	if isLocalDst(od.ip) {
+		// P0-1：非重定向流（LAN 设备/本机进程直连 gate 监听口）。放行会让
+		// origdst=本机:port → proxy/default → 代理侧路由连回自己，
+		// 形成链式自环直到 fd 打满（实测一条连接可链出 252 条）。只按地址类别
+		// 判、不看端口：公网真有 :12347 服务，正常重定向流可能合法命中。
+		writeStat("gate_tcp_local_drop", 1)
+		logTCPLocalDrop(src, od)
+		return
+	}
 	buf := make([]byte, 1024)
-	// opportunistic peek：:80 短读（有数据即判正常 classify，无则 port80）；
-	// 443/奇端口全量 peek（TLS/HTTP 判定省不掉）。
+	// R8 opportunistic peek：:80 短读；443/奇端口全量 peek（TLS/HTTP 判定省不掉）。
 	n := peekClient(tc, buf, od.port)
 
 	verdict, reason := classify(od, buf[:n])
-	if n == 0 && od.port != 80 && verdict != "proxy" && verdict != "block" {
-		// 非 80 静默连接查 proxy 端点记忆，命中则复用原 reason 进 proxy
-		// （fail-closed）；未知端点仍 default fail-open（如 5438 类保活）。
-		if rsn, ok := proxyMemLookup(od); ok {
-			verdict, reason = "proxy", rsn
-			writeStat("gate_silentreuse", 1)
-		}
-	}
-	bindIP, bindPort := passBindAddr(raw.RemoteAddr())
 	emitOpen("tcp", src, od, verdict, reason)
-	var up *net.TCPConn
-	if verdict == "block" {
-		// 政策阻断（DoH 等）：直接断流，不建上游。
-		writeStat("gate_block", 1)
-		logGate(src, od, "block", reason, buf[:n])
-		return
-	}
-	if verdict == "proxy" {
-		// fail-closed（守门员策略）：识别到的包只许进代理——拨号目标是下游
-		// 敏感/加密入口（proxySocks，可用 WD_PROXY_SOCKS 覆盖）；下游不可用
-		// 才断流（err/*_proxy_fail），绝不回退直连。若下游支持拨号超时重试，
-		// 可在同一请求内重试一次（可选）。非 80 端点同时记入 proxy 端点记忆，
-		// 供后续静默复用连接收敛。
-		proxyMemStore(od, reason)
-		up, err = socks5Dial(proxySocks, od, nil, 0)
-		if err != nil {
-			writeStat("gate_proxy_fail", 1)
-			writeStat("gate_dial_err", 1)
-			logGate(src, od, "err", reason+"_proxy_fail", buf[:n])
-			emitErrorEvent("tcp", src, od, "err", reason+"_proxy_fail", err.Error())
-			log.Printf("#%d %s -> %s proxy dial fail (fail-closed): %v", id, src, od, err)
-			return
-		}
-	} else {
-		up, err = socks5Dial(passSocks, od, bindIP, bindPort)
-	}
-	if err != nil {
-		writeStat("gate_dial_err", 1)
-		logGate(src, od, "err", reason, buf[:n])
-		emitErrorEvent("tcp", src, od, "err", reason, err.Error())
-		log.Printf("#%d %s -> %s dial: %v", id, src, od, err)
+	up := openUpstream(verdict, reason, od, src, id, buf[:n])
+	if up == nil {
 		return
 	}
 	defer up.Close()
@@ -1114,8 +821,37 @@ func handleConn(raw net.Conn) {
 	writeStat("gate_conn", 1)
 	writeStat("gate_"+verdict, 1)
 	writeStat("gate_rsn_"+reason, 1)
-	logGate(src, od, verdict, reason, buf[:n])
+	logGate("tcp", src, od, verdict, reason, buf[:n])
 	relay(tc, up, src, od, verdict, reason, start)
+}
+
+// openUpstream 按 verdict 拨**唯一**上游；返回 nil 表示本连接已收尾
+// （失败一律 fail-closed：断流，绝不改拨第二条腿）。
+// pass→passSocks（失败计 gate_pass_fail），proxy→proxySocks（失败计 gate_proxy_fail），
+// 未知 verdict 防御性归入 pass 腿（classify 只产出 pass/proxy，到不了这里）。
+func openUpstream(verdict, reason string, od dstAddr, src string, id uint64, head []byte) *net.TCPConn {
+	if verdict == "proxy" {
+		up, err := socks5Dial(proxySocks, od, nil, 0)
+		if err != nil {
+			writeStat("gate_proxy_fail", 1)
+			writeStat("gate_dial_err", 1)
+			logGateErr("tcp", src, od, "err", reason+"_proxy_fail", err.Error(), head)
+			emitErrorEvent("tcp", src, od, "err", reason+"_proxy_fail", err.Error())
+			log.Printf("#%d %s -> %s proxy dial fail (fail-closed): %v", id, src, od, err)
+			return nil
+		}
+		return up
+	}
+	up, err := socks5Dial(passSocks, od, nil, 0)
+	if err != nil {
+		writeStat("gate_pass_fail", 1)
+		writeStat("gate_dial_err", 1)
+		logGateErr("tcp", src, od, "err", reason, err.Error(), head)
+		emitErrorEvent("tcp", src, od, "err", reason, err.Error())
+		log.Printf("#%d %s -> %s dial: %v", id, src, od, err)
+		return nil
+	}
+	return up
 }
 
 func isTimeout(err error) bool {

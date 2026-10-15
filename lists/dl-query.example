@@ -1,0 +1,5 @@
+# dl-query.txt —— URL query 预签名/强制下载参数（小写子串匹配，30s 热加载）
+# 只收无 Range 头的单 GET 下载链（排 Range 之后，保 dl_range 标签稳定）。
+# 命中记 pass/dl_query。
+force-download
+download=1

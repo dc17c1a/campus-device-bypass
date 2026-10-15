@@ -6,18 +6,17 @@ mtime/size 热加载，不用重启进程；文件缺失/某次读取失败时�
 
 | 文件 | 复制为 | 消费方与语义 |
 |---|---|---|
-| `gate.kw.example` | `/etc/wxdet/gate.kw` | gate TCP 关键词：对 HTTP Host / 请求行 / UA 做**小写子串**匹配（域名/包名/协议串混杂），命中即 `proxy` |
-| `dl-domains.example` | `/etc/wxdet/dl-domains.txt` | 下载站域名：**精确或子域后缀**匹配，命中 → `pass/dl_direct`（转交下游入口） |
-| `dl-ua.example` | `/etc/wxdet/dl-ua.txt` | 下载器 UA token：**小写子串**匹配，命中 → `pass/dl_ua` |
-| `dl-ext.example` | `/etc/wxdet/dl-ext.txt` | 二进制/媒体 URL 后缀（不含 `.`），命中 → `pass/dl_ext` |
-| `bsf-domains.example` | `/etc/wxdet/bsf-domains.txt` | 运营商 BSF/RCS 信令域名，命中 → `pass/bsf_direct`（运营信令转交下游，不随逃生开关回滚） |
-| `doh-domains.example` | `/etc/wxdet/doh-domains.txt` | 加密 DNS 域名：精确/子域命中 → `block/dns_block`；下游代理路由里还有一份同源 block 规则 |
-| `doh-ips.example` | `/etc/wxdet/doh-ips.txt` | 加密 DNS 解析器 IP：**精确**命中（443 端口）→ `block/dns_block`；gate 内置一份常见解析器种子，文件只增不减 |
+| `dl-domains.example` | `/etc/wxdet/dl-domains.txt` | gate：下载站域名**精确或子域后缀**匹配，命中 → `pass/dl_direct`（转交下游入口） |
+| `dl-ua.example` | `/etc/wxdet/dl-ua.txt` | gate：下载器 UA token**小写子串**匹配，命中 → `pass/dl_ua` |
+| `dl-ext.example` | `/etc/wxdet/dl-ext.txt` | gate：二进制/媒体 URL 后缀（不含 `.`），命中 → `pass/dl_ext` |
+| `dl-query.example` | `/etc/wxdet/dl-query.txt` | gate：URL query 预签名/强制下载参数子串，命中 → `pass/dl_query`（排 Range 之后） |
+| `bsf-domains.example` | `/etc/wxdet/bsf-domains.txt` | 下游代理路由用：运营商信令域名（gate 当前版本不读，留作路由侧合并规则输入） |
+| `doh-domains.example` | `/etc/wxdet/doh-domains.txt` | 下游代理路由用：加密 DNS 域名 block（gate 当前版本不判 `block`，封堵由下游执行） |
+| `doh-ips.example` | `/etc/wxdet/doh-ips.txt` | 下游代理路由用：加密 DNS 解析器 IP block（同上） |
 
 说明：
 
-- 列表是**样例**而非全量生产名单。特别是 DoH 两份长名单（实际部署 1923 域 /
-  3514 IP），请自行从上游组合生成，例如
+- 列表是**样例**而非全量生产名单。特别是 DoH 两份长名单，生产请自行从上游组合生成，例如
   [dibdot/DoH-IP-blocklists](https://github.com/dibdot/DoH-IP-blocklists)、
   [Sekhan/TheGreatWall](https://github.com/Sekhan/TheGreatWall)。
 - 格式统一为逐行一条、`#` 开头为注释；域名匹配大小写不敏感、忽略结尾点。

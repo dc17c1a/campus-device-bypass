@@ -45,7 +45,7 @@ func readLines(t *testing.T, p string) []string {
 	return strings.Split(s, "\n")
 }
 
-// tls_direct 只走 stats 计数，不进流；其余 verdict 全进流。
+// tls_direct 只走 stats 计数，不进流（过滤只看 reason，不看 verdict）；其余 reason 全进流。
 func TestEventsOpenFilterTLS(t *testing.T) {
 	p := tempEvents(t)
 	src := "192.168.2.50:40000"
@@ -84,5 +84,24 @@ func TestEventsOpenFilterTLS(t *testing.T) {
 	}
 	if mu["proto"] != "udp" || mu["verdict"] != "proxy" || mu["reason"] != "stun_udp" {
 		t.Fatalf("udp open fields: %v", mu)
+	}
+	// 过滤只看 reason：verdict 不参与——标准 TLS 直通的 direct/tls_direct 与历史
+	// xray/tls_direct 一律不进流；443/8000-10000 兜底的 proxy/default 照常进流。
+	emitOpen("tcp", src, odTLS, "pass", "tls_direct")
+	emitOpen("tcp", src, odTLS, "xray", "tls_direct")
+	if lines := readLines(t, p); len(lines) != 2 {
+		t.Fatalf("tls_direct must not emit (reason-only filter), got %d lines", len(lines))
+	}
+	emitOpen("tcp", src, dstAddr{ip: net.ParseIP("1.2.3.4"), port: 8443}, "proxy", "default")
+	lines = readLines(t, p)
+	if len(lines) != 3 {
+		t.Fatalf("proxy/default open must append, got %d lines", len(lines))
+	}
+	var mt map[string]any
+	if err := json.Unmarshal([]byte(lines[2]), &mt); err != nil {
+		t.Fatalf("proxy/default open not json: %v", err)
+	}
+	if mt["verdict"] != "proxy" || mt["reason"] != "default" {
+		t.Fatalf("proxy/default open fields: %v", mt)
 	}
 }

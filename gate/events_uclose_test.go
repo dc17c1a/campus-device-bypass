@@ -40,7 +40,7 @@ func TestAssocCloseEmitsUCloseOnce(t *testing.T) {
 	a := &udpAssoc{key: udpAssocKey(client, od), client: client, dst: od, reason: "stun_udp"}
 	a.start.Store(time.Now().Add(-2 * time.Second).UnixNano())
 	a.last.Store(time.Now().UnixNano())
-	a.toProxy = true
+	a.toProxy.Store(true)
 	a.upPkts.Store(2)
 	a.downPkts.Store(1)
 	a.upBytes.Store(120)

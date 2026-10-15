@@ -72,8 +72,8 @@ flowchart TB
 
     subgraph NFT["二 nftables 分流（见 deploy/nftables/）"]
         R1["iot_redir<br/>TCP 除 53/保留口、私网、上游网关<br/>redirect :12347"]
-        R2["iot_udp_proxy<br/>公网 UDP 全量（除 53/123/443/853）<br/>mark 0x100 + TPROXY :12348"]
-        R3["旁路链<br/>53 劫持 / 853 拒绝 / 123 劫持<br/>443 QUIC 拒绝 / 出口指纹整理"]
+        R2["iot_udp_proxy<br/>公网 UDP（除 53/123/443/853）<br/>跳过私网/组播/广播<br/>mark 0x100 + TPROXY :12348"]
+        R3["旁路链<br/>53 劫持 / 853 双栈拒绝 / 123 劫持<br/>443 QUIC 拒绝 / 特定网段 DROP<br/>IPv6 DROP / 1080 保护"]
     end
 
     subgraph GATE["三 wxdet-gate 唯一裁判（本仓库 gate/，fail-closed）"]
@@ -96,12 +96,13 @@ flowchart TB
         GF["fail-closed<br/>拨号/中继失败即断流<br/>不改拨第二腿"]
     end
 
-    subgraph SB["四 下游路由（示例 deploy/sing-box/，现网已瘦身为三规则）"]
+    subgraph SB["四 下游路由（示例 deploy/sing-box/，现网四规则 + final）"]
         direction LR
         SI["入站<br/>代理专用 :10811 / 管理 :10808"]
-        SR0["代理入口命中 → 隧道组"]
-        SR1["私网 / 私有域名 → 直连"]
-        SR2["TCP 兜底 → 经指纹整理出口"]
+        SR0["r0 代理入口命中 → 隧道组"]
+        SR1["r1 私网段 → 直连"]
+        SR2a["r2 私有域名 → 直连"]
+        SR2["r3 TCP 兜底 → 经指纹整理出口"]
     end
 
     subgraph EG["五 出口与整理"]
@@ -110,7 +111,7 @@ flowchart TB
         PX["隧道组<br/>按延迟选路 + 故障转移"]
         DR["直连出口"]
         NET["公网出口"]
-        FP["TTL / IPID / MSS 统一整理"]
+        FP["TTL 三处 / IPID 双机制<br/>MSS 双向 / ICMP 伪装"]
     end
 
     subgraph ZAP["六 zapret（出口 TCP 80/443 NFQUEUE 脱敏）"]
@@ -140,16 +141,19 @@ flowchart TB
     GS -.->|"中继失败"| GF
     SI --> SR0
     SI --> SR1
+    SI --> SR2a
     SI --> SR2
     SR0 --> PX
     SR1 --> DR
+    SR2a --> DR
     SR2 --> UA
+    SR2 -.->|"非 TCP 落空"| DR
     UA --> ZQ
     DR --> ZQ
     ZQ --> ZN
     ZN --> ZX
     ZX --> NET
-    PX --> NET
+    PX -->|"加密出境（出向规则同样约束，以豁免集为准）"| NET
     UA -.-> FP
     R3 -.-> FP
 
@@ -165,7 +169,7 @@ flowchart TB
     class C,GW,UP,NET src;
     class R1,R2,ZQ,ZN nft;
     class GT,GU,GP,GX,GS,GL gate;
-    class SI,SR0,SR1,SR2 sb;
+    class SI,SR0,SR1,SR2,SR2a sb;
     class PX tun;
     class UA,DR,GH ok;
     class GD,GUD,GF drop;
@@ -177,12 +181,11 @@ flowchart TB
 | 流量 | 路径 | 说明 |
 |---|---|---|
 | TCP（除 53/1080、私网、上游网关目的） | `iot_redir` → **gate TCP :12347** | gate 二判：`pass`（TLS/下载特征）转交下游入口 / `proxy`（其余）进代理 |
-| 公网 UDP（除 53/123/443/853） | `iot_udp_proxy` 全量 TPROXY → **gate UDP :12348** | gate 判定 STUN 形状与目的端口；`proxy` 走 SOCKS5-UDP 中继 |
-| 公网 UDP（除 53/123/443/853） | `iot_udp_proxy` → **gate UDP :12348** | gate 判定：`proxy` 中继 / `pass` 直拨回源 |
-| UDP 443（QUIC） | `iot_quic_block` reject | 不经 gate；逼客户端回落 TCP，才能进代理链 |
+| 公网 UDP（除 53/123/443/853，跳过私网/组播/广播） | `iot_udp_proxy` 全量 TPROXY → **gate UDP :12348** | gate 判定 STUN 形状与目的端口：`proxy` 中继 / `pass` 直拨回源 |
+| UDP 443（QUIC） | `iot_quic_block`（forward 链）reject | 不经 gate；逼客户端回落 TCP，才能进代理链 |
 | DNS（53）、DoT（853）、NTP（123） | `dns_force_*` / `iot_ntp_hijack` → 本机 dnsmasq/NTP | 不经 gate；上游 DoH，加密 DNS 封堵由下游代理名单执行 |
 | 私网互访、发往上游网关的管理流量 | 直接放行 | 不经 gate |
-| 所有出境包的 L3 收尾 | `iot_mangle_post`（TTL=64、IPID=0 等） | 不经 gate；受管网段全部流量生效 |
+| 所有出境包的 L3 收尾 | TTL=64、IPID=0（mangle/postrouting）+ ICMP 伪装（独立 srcnat 链） | 不经 gate；受管网段全部流量生效 |
 
 ### 2.3 出口
 
@@ -199,7 +202,7 @@ flowchart TB
 
 | # | 条件（首包特征） | verdict/reason | 去向 |
 |---|---|---|---|
-| 1 | TLS ClientHello（严判：`16 03` + 版本/长度/握手类型） | `pass/tls_direct` | 下游入口 |
+| 1 | TLS ClientHello（严判：`16 03` + 次版本≤0x03 + 记录长 1..18432 + 握手类型 0x01） | `pass/tls_direct` | 下游入口 |
 | 2 | 明文 HTTP 且 Host ∈ 下载站名单 | `pass/dl_direct` | 下游入口 |
 | 3 | 明文 HTTP 且带 `Range:` 头（下载器/续传特征） | `pass/dl_range` | 下游入口 |
 | 4 | 明文 HTTP 且 URL query 命中预签名/强制下载参数 | `pass/dl_query` | 下游入口 |
@@ -211,7 +214,7 @@ flowchart TB
 
 - **`:80` 短读**：`WD_PEEK80_MS`（默认 80ms）opportunistic 短读 —— 客户端建连即发
   请求，局域网内必在途；读到即正常判定，静默/非 HTTP 落 `proxy/default`。
-- **非 80 短读补齐**：`0x16` 开头但首读不足 6 字节时，在同一 peek 预算内续读到
+- **非 80 短读补齐**：`0x16` 开头但首读不足 6 字节时，在同一 150ms 预算内续读到
   6 字节再做 TLS 严判。
 - **头/体隔离**：Host/Path/UA/Range 只在 header block（首个 `\r\n\r\n` 之前）内找，
   POST body 里的特征串不再翻转判路。
@@ -229,6 +232,9 @@ flowchart TB
 |---|---|---|
 | 标准 STUN 魔数 `21 12 a4 42` + 首 2bit 为 0 + 长度一致 | `proxy/stun_udp` | 代理（SOCKS5-UDP 中继） |
 | 变种 STUN（`0001/0101` 包型，事务配对） | `proxy/stun_udp_var` | 代理（SOCKS5-UDP 中继） |
+
+> 长度声明不一致的 STUN 形包（`20+msgLen > 包长`）先落 `udp_direct`，再按目的端口
+> 走端口规则（低端口归 `udp_proxy`）：形状与端口两段式，见 `gate/udp.go`。
 | 非 STUN 且目的端口 ≤10000 | `proxy/udp_proxy` | 代理（SOCKS5-UDP 中继） |
 | 短包（<20B）且目的端口 ≤10000 | `proxy/udp_proxy` | 代理（形状不足判代理，fail-closed） |
 | 短包（<20B）/非 STUN 且目的端口 >10000 | `pass/udp_short`、`pass/udp_direct` | 直连回源（直拨目的） |
@@ -239,7 +245,7 @@ flowchart TB
 - **下行保源**：每个 assoc 建透明 socket 绑定对端地址回包（握手校验源的客户端
   可接受），失败降级为监听 socket（各记一个计数器，只降级一次）。
 - **状态表**：按 `客户端 + 目的` 维护 assoc，空闲 120s 回收，上限 512 条，
-  防环丢弃 loopback/私网/链路本地目的。
+  防环丢弃 loopback/私网/链路本地/未指定目的。
 
 ### 3.3 术语对照（重要）
 
@@ -275,8 +281,8 @@ flowchart TB
 | `uclose` | `…, dur_ms, up_pkts, down_pkts, up_B, down_B` |
 | `error` | `…, verdict:"err", reason, detail` |
 
-> `pass/tls_direct` 这类大流量普通连接只进 `stats.tsv` 计数、不进事件流，
-> 避免观测文件被冲爆。
+> `pass/tls_direct` 这类大流量普通连接只进 `stats.tsv` 计数、不进 open/close 事件流，
+> 避免观测文件被冲爆（error 事件照进：`pass` 腿拨号失败会落 `err` 行）。
 
 ## 4. 快速开始
 
@@ -350,7 +356,7 @@ ssh root@<router> 'logread | grep wxdet-gate | tail'
 ssh root@<router> 'tail /tmp/wxdet/gate.log; tail -3 /tmp/wxdet/stats.tsv'
 
 # 2) nft 计数器在动（redirect/tproxy 命中）
-ssh root@<router> 'nft list chain inet fw4 iot_redir; nft list chain inet fw4 iot_stun_dnat'
+ssh root@<router> 'nft list chain inet fw4 iot_redir; nft list chain inet fw4 iot_udp_proxy'
 
 # 3) 端到端：经 10808 出口访问
 curl -x socks5h://127.0.0.1:10808 -sS -o /dev/null -w '%{http_code}\n' https://example.com
@@ -375,7 +381,7 @@ tail -5 /tmp/wxdet/events.jsonl      # 统一事件流
 | `WD_DL_DOM_FILE` / `WD_DL_UA_FILE` / `WD_DL_EXT_FILE` / `WD_DL_QUERY_FILE` | `/etc/wxdet/dl-*.txt` | 下载站/下载器名单（dl-query 为 URL 参数签名） |
 | `WD_PEEK_MS` | `400` | 非 80 首包等待（ms） |
 | `WD_PEEK80_MS` | `80` | `:80` opportunistic 短读（ms） |
-| `WD_KW_POLL_SEC` | `30` | 名单轮询周期（秒），`<=0` 关闭 |
+| `WD_KW_POLL_SEC` | `30` | 名单轮询周期（秒），`<=0` 关闭（旧名见 §9 映射，迁移须同步改启动脚本 env） |
 | `WD_LOG` / `WD_STATS` / `WD_EVENTS` | `/tmp/wxdet/gate.log` / `stats.tsv` / `events.jsonl` | 观测输出 |
 | `WD_UDP_FIXED_DST` | 空 | 调试用：跳过 origdst，固定中继目的（生产勿设） |
 | `WD_UDP_ERR_LOG` | `/tmp/wxdet/udp_err.log` | UDP 门错误采样日志（每进程 5 秒一行） |
@@ -387,8 +393,8 @@ tail -5 /tmp/wxdet/events.jsonl      # 统一事件流
 代理不可用时宁断流。恢复下游代理（检代理入口侦听/远端节点）即恢复。
 
 **Q：代理全挂后整个受管网段都上不了网？**
-不会全断：只有被判 `proxy`/`block` 的流量受影响，`pass` 类（TLS/下载等）转交下游入口后按下游路由处理；但 `proxy` 类会持续失败直到下游恢复。应急可先摘掉重定向链：
-`nft flush chain inet fw4 iot_redir`（再 `nft flush chain inet fw4 iot_stun_dnat`），
+不会全断：只有被判 `proxy` 的流量受影响（`block` 是下游代理的出站动作，gate 只产出 pass/proxy/drop/err），`pass` 类（TLS/下载等）转交下游入口后按下游路由处理；但 `proxy` 类会持续失败直到下游恢复。应急可先摘掉重定向链：
+`nft flush chain inet fw4 iot_redir`（再处理 `iot_udp_proxy` 的 mark/TPROXY 规则并 `conntrack -D -p udp`），
 停 gate 服务，等修复后再接回。
 
 **Q：能不能先只观察不改流量？**
@@ -404,8 +410,9 @@ loopback 入站；`10808` = 下游 socks/mixed 示例入口；`12346` 已退役
 `malformed HTTP request` + 超时，是假故障。
 
 **Q：名单改了要重启吗？**
-不用。30 秒内自动热加载；只有下游代理侧路由（下载站 `via-ua3f`、DoH block、
-proxy 尾段）需要按你的配置方式重新生成并 restart 下游代理。
+不用。30 秒内自动热加载；只有下游代理侧路由需要按你的配置方式重新生成并
+restart 下游代理（历史形态注记：早期的下载站 `via-ua3f` 早位规则、DoH block、
+proxy 尾段现网已删；gate 为下载站/STUN 的唯一判点）。
 
 **Q：观测文件会不会无限涨？**
 项目本身不做轮转：`stats.tsv`/`events.jsonl`/`gate.log` 的轮转与截断由系统
@@ -421,13 +428,19 @@ gate 是纯转发进程，Go 运行时按小内存路由器调优（示例 `GOGC
 
 | 检测项 | 本方案对应 |
 |---|---|
-| TTL / IPID / ICMP | `32-egress-fingerprint.nft`：TTL=64、IPID=0、ICMP 伪装、IPv6 drop |
+| TCP 80/443 DPI 脱敏 | `deploy/zapret/`：nfqws 伪造分片/乱序/坏序列 + 小 TTL 探针，只动首批包与握手散件，豁免标记免二次改写 |
+| TTL | nft 出向改 64 + ua3f L3 重写 64；另有 zapret 小 TTL 探针（用途不同，不要混淆） |
+| IPID | nft 原子包置 0 + 独立 `ipidfix` 服务补 DF 包置 0（ua3f 该项保持关闭） |
+| MSS | `34-mss-clamp.nft`：出向按路由 MTU + 回程 forward 双向钳制 |
+| ICMP | 独立 srcnat 链伪装 |
 | HTTP UA / TLS 指纹 | `via-ua3f` 出口 + ua3f `l3_rewrite_*`（UA 归一、去时间戳、窗口统一） |
 | NTP | `33-dns-ntp.nft`：UDP 123 劫持到本机 |
-| DNS/DoH 画像 | 53 劫持到 dnsmasq→DoH、853 拒绝、DoH 名单封堵（下游代理执行） |
+| DNS/DoH 画像 | 53 劫持到 dnsmasq→DoH、TCP/UDP 853 拒绝；示例保留历史 DoH block 形态，现网瘦身后 block 规则已删 |
 | DPI 应用特征（微信/QQ/抖音/游戏） | gate 首包二判（非 TLS/下载特征即 `proxy`） + 下载名单 → `pass` |
-| UDP 会话/STUN | `31-gate-udp.nft` + gate STUN 判定与中继 |
-| QUIC 绕过 | `iot_quic_block` 拒绝，逼回 TCP 进代理链 |
+| UDP 会话/STUN | `31-gate-udp.nft` 全量 TPROXY + gate STUN 判定与中继 |
+| QUIC 绕过 | `iot_quic_block`（forward 链）拒绝，逼回 TCP 进代理链 |
+| 特定网段/IPv6/保留口 | `29-spec-drop.nft` 硬 DROP（目的集按环境填）、IPv6 出境 DROP、`1080` 保护 |
+| TCP 全量出口 | 现网 `network: tcp` 全量 → `via-ua3f`（含 443，无单独 443 规则） |
 | 私有客户端心跳 | 不在本仓库范围（认证层问题） |
 
 完整原理、厂商实现与边界讨论见
@@ -454,6 +467,9 @@ gate 是纯转发进程，Go 运行时按小内存路由器调优（示例 `GOGC
 | `WD_UA3F_SOCKS` | `WD_PASS_SOCKS` | 默认同为 `127.0.0.1:18081` |
 | `WD_HEZI_SOCKS` | `WD_PROXY_SOCKS` | 默认同为 `127.0.0.1:10811` |
 | `gate_direct_fail` / `gate_hezi_*` | `gate_pass_fail` / `gate_proxy_*` | 统计键同上映射 |
+| `gate_direct_udp` | `gate_pass_udp` | UDP 直拨 assoc 计数 |
+| `gate_hezi_udp`（含 `_fail`） | `gate_proxy_udp`（含 `_fail`） | UDP 中继 assoc 计数 |
+| `udp_upgrade_hezi_fail` | `udp_upgrade_proxy_fail` | 升级失败事件 reason |
 四份区域（`gate/`、`deploy/`、`lists/`、`docs/`）各自独立演进，改动建议附测试
 （`make` 会跑 gofmt/vet/test）。
 

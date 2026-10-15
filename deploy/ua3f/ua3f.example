@@ -7,9 +7,11 @@
 #   a) 作为 SOCKS5 上游（下游代理的 via-ua3f 出口）：把明文 HTTP 的 UA 统一
 #      改写为一个常见、真实的值，抹掉 OS/浏览器/App 差异（校园网最便宜的检测
 #      维度之一就是 UA）；同时做 L3 指纹整理（TCP 时间戳/窗口等）。
-#   b) 配合 nft NFQUEUE 钩子（把全部 TCP SYN 交给 ua3f）做连接级指纹整理。
+#   b) L3 指纹整理（TCP 时间戳/窗口/TTL 等，由 UA3F_L3_* 环境开关控制）。
 # 伪装值务必与你的 TLS 指纹/实际客户端形态一致：UA 声称 Chrome 而指纹是 Go
-# 等于自爆（选一个主流值，不要用带 App 尾巴的稀有串）。
+# 等于自爆。选一个主流通用值；带 App 尾巴的稀有串只在你全网真用该 App 时才考虑。
+# desync（reorder/inject）保持关闭——脱敏由 deploy/zapret 承担，两边同时开会互扰。
+# 同二进制可再起第二实例（另写 config 段 + 改 init NAME；曾用于灰度与分流）。
 config ua3f 'enabled'
 	option enabled '1'
 
@@ -18,10 +20,10 @@ config ua3f 'main'
 	option bind '127.0.0.1'
 	option port '18081'
 	option rewrite_mode 'GLOBAL'
-	option ua 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) +CoolMarket/15.1.0-2502241-universal'
+	option ua 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 	option log_level 'WARN'
 	option log_lines '1000'
-	option header_rewrite '[{"enabled":true,"type":"FINAL","action":"REPLACE","rewrite_value":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) +CoolMarket/15.1.0-2502241-universal","rewrite_header":"User-Agent","description":"Default Fallback Rule"}]'
+	option header_rewrite '[{"enabled":true,"type":"FINAL","action":"REPLACE","rewrite_value":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36","rewrite_header":"User-Agent","description":"Default Fallback Rule"}]'
 	option l3_rewrite_ttl '1'
 	option l3_rewrite_tcpts '1'
 	option l3_rewrite_tcpwin '1'

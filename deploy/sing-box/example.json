@@ -22,13 +22,6 @@
       "listen_port": 10808
     },
     {
-      "type": "tproxy",
-      "tag": "transparent-udp",
-      "listen": "::",
-      "listen_port": 12346,
-      "network": "udp"
-    },
-    {
       "type": "socks",
       "tag": "proxy-in",
       "listen": "127.0.0.1",
@@ -108,8 +101,7 @@
       {
         "action": "sniff",
         "inbound": [
-          "socks",
-          "transparent-udp"
+          "socks"
         ],
         "timeout": "300ms"
       },
@@ -122,74 +114,21 @@
       },
       {
         "action": "route",
-        "network": "udp",
-        "port": [
-          443
-        ],
-        "outbound": "block"
-      },
-      {
-        "action": "route",
-        "domain": [
-          "dns.google",
-          "doh.pub",
-          "dns.alidns.com",
-          "cloudflare-dns.com"
-        ],
-        "outbound": "block"
-      },
-      {
-        "action": "route",
-        "ip_cidr": [
-          "8.8.8.8/32",
-          "8.8.4.4/32",
-          "1.1.1.1/32",
-          "9.9.9.9/32"
-        ],
-        "outbound": "block"
-      },
-      {
-        "action": "route",
-        "network": "tcp",
-        "port": [
-          443
-        ],
-        "outbound": "via-ua3f"
-      },
-      {
-        "action": "route",
-        "domain_suffix": [
-          ".dl.example.com",
-          ".download.example.com"
-        ],
-        "outbound": "via-ua3f"
-      },
-      {
-        "action": "route",
-        "port": [
-          3478,
-          5349,
-          19302
-        ],
-        "outbound": "proxy"
-      },
-      {
-        "action": "route",
         "ip_cidr": [
           "10.0.0.0/8",
-          "172.16.0.0/12",
-          "192.168.0.0/16",
           "127.0.0.0/8",
-          "169.254.0.0/16"
+          "172.16.0.0/12",
+          "192.168.0.0/16"
         ],
         "outbound": "direct"
       },
       {
         "action": "route",
         "domain_suffix": [
-          ".example-app.com"
+          ".local.example",
+          ".home.example"
         ],
-        "outbound": "proxy"
+        "outbound": "direct"
       },
       {
         "action": "route",

@@ -20,6 +20,7 @@ mtime/size 热加载，不用重启进程；文件缺失/某次读取失败时�
   [dibdot/DoH-IP-blocklists](https://github.com/dibdot/DoH-IP-blocklists)、
   [Sekhan/TheGreatWall](https://github.com/Sekhan/TheGreatWall)。
 - 格式统一为逐行一条、`#` 开头为注释；域名匹配大小写不敏感、忽略结尾点。
-- 改名单后若要同步下游代理路由规则（如下载站 `via-ua3f` 早位规则、
-  DoH block 规则、proxy 尾段），需要按你的下游代理配置方式重新生成；示例后端用
+- 改名单后若要同步下游代理路由规则，需要按你的下游代理配置方式重新生成；示例后端用
   `sing-box check` 后重启；gate 侧名单是即时生效的。
+  （历史形态注记：早期的下载站 `via-ua3f` 早位规则、DoH block 规则现网已删，
+  gate 为下载站/STUN 的唯一判点；`example.json` 已同步为四规则形态。）

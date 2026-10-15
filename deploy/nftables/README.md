@@ -7,9 +7,12 @@ fw4 的具名 set/链）。文件编号即加载顺序，可自行改名，链�
 | 文件 | 内容 |
 |---|---|
 | `30-gate-redir.nft` | 受管网段 TCP → `:12347` 重定向（`iot_redir`）+ 保留口防护（`drop1080`） |
+| `29-spec-drop.nft` | 特定网段硬 DROP（占位 set，按环境填） |
 | `31-gate-udp.nft` | 受管网段公网 UDP 全量 TPROXY → gate `:12348`（`iot_udp_proxy`，唯一裁判；DNAT 已退役） |
 | `32-egress-fingerprint.nft` | 出口指纹整理：TTL=64、IPID=0、ICMP 伪装、IPv6 drop、QUIC reject |
 | `33-dns-ntp.nft` | DNS 收敛（53 劫持、TCP/UDP 853 拒绝）与 NTP 劫持 |
+| `34-mss-clamp.nft` | MSS 双向钳制（出向按路由 MTU + 回程 forward） |
+| `35-observe.nft` | 纯观测方法（port80 归属计数 + RST 注入观测，只计数） |
 
 ## 使用与注意事项
 

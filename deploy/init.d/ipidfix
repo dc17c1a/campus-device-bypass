@@ -1,0 +1,31 @@
+#!/bin/sh /etc/rc.common
+# ipidfix —— 将经本机 IP 层出向的 DF 包 IPv4 Identification 固定为 0。
+# 背景：L3 指纹改写一般只覆盖 TCP，UDP/ICMP 仍暴露内核原生递增 ID；
+# 本服务补齐该缺口，使全网特征统一。
+# 范围：仅 DF 置位包（ip frag-off & 0x4000 != 0）。DF 包永不发生分片，
+# ID 置 0 无副作用（RFC 6864）；非 DF 包保持原生唯一 ID 以保分片重组。
+# 实现：独立表 inet ipidfix，postrouting priority mangle + 10。
+# 生效范围：本机 OUTPUT + 三层转发（二层桥接流量不经 IP 层，天然不受影响）。
+START=20
+STOP=80
+
+start() {
+	nft delete table inet ipidfix 2>/dev/null
+	nft add table inet ipidfix
+	nft add chain inet ipidfix postrouting '{ type filter hook postrouting priority mangle + 10; policy accept; }'
+	nft add rule inet ipidfix postrouting 'ip frag-off & 0x4000 != 0 ip id != 0 ip id set 0'
+}
+
+stop() {
+	nft delete table inet ipidfix 2>/dev/null
+	return 0
+}
+
+restart() {
+	stop
+	start
+}
+
+reload() {
+	restart
+}

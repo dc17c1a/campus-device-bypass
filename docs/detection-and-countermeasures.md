@@ -99,7 +99,7 @@ HTTPS 普及正在把检测重心从 UA 推向 JA3/DPI + 时钟偏移，但受�
   域名"=笔记本开热点）。经典研究：清华 RAIM'15，仅 DNS log >90% 准确率。
 - **局限**：DNS 被劫持/缓存后出口只见路由器；DoH/DoT 后失效。
 - **对抗点**：DNS 劫持到本机 + DoH 上游（`33-dns-ntp.nft` 与本仓库 README 的
-  dnsmasq 配置）；同时封堵客户端自带的加密 DNS（见 §1.10 与 gate 的 DoH 名单）。
+  dnsmasq 配置）；同时封堵客户端自带的加密 DNS（见 §4 表：下游代理的 DoH 名单 `lists/doh-*.example`；gate 当前版本不读 DoH 名单）。
 
 ### 1.11 DPI 行为画像
 - **原理**：深度解析应用层，提取账号/设备 ID/行为序列（同 IP 多微信号、多
@@ -212,9 +212,9 @@ iptables -t nat -I PREROUTING -p udp --dport 123 -j ntp_force_local
 | HTTP UA | 出口 UA 全量改写为统一值 | ua3f（`deploy/ua3f/ua3f.example`，经下游 `via-ua3f` 出口） |
 | IP TTL | 出受管网段统一 TTL=64 | `deploy/nftables/32-egress-fingerprint.nft`（`iot_mangle_post`） |
 | IPID | 原子包 IPID=0 | 同上（`all-ipid-zero-iot`） |
-| TCP 指纹/时间戳 | 直连类流量经 ua3f 重建；`tcp/443` 也规则化走 `via-ua3f` | 下游代理路由 + ua3f `l3_rewrite_*` |
+| TCP 指纹/时间戳 | 直连类流量经 ua3f 重建；现网 `network: tcp` 全量 → `via-ua3f`（含 443，无单独 443 规则） | 下游代理路由 + ua3f `l3_rewrite_*` |
 | NTP | UDP 123 劫持到本机 | `deploy/nftables/33-dns-ntp.nft` + `system.ntp.enable_server` |
-| DNS/DoH 画像 | 53 劫持到 dnsmasq→DoH；853 reject；DoH 域名/IP 封堵 | `33-dns-ntp.nft` + gate 的 DoH 名单（`lists/doh-*.example`）+ 下游代理 block 规则 |
+| DNS/DoH 画像 | 53 劫持到 dnsmasq→DoH；TCP/UDP 853 reject；DoH 名单封堵由下游代理执行（gate 当前版本不判 block；现网瘦身后下游 block 规则亦删，53 劫持与 DoH 上游仍在） | `33-dns-ntp.nft` + `lists/doh-*.example` |
 | JA3/DPI 应用特征 | 有账号价值的流量（微信/QQ/抖音/游戏/私有协议）全部进代理 | gate 判定（`proxy`） + 下游 `proxy` 组（示例见 `deploy/sing-box/example.json`） |
 | UDP 会话/STUN | STUN 统一进 gate 判定并中继，非 STUN 才直连 | `deploy/nftables/31-gate-udp.nft` + `gate/udp.go` |
 | QUIC 绕过代理链 | `udp/443` reject 逼回 TCP | `32-egress-fingerprint.nft`（`iot_quic_block`） |

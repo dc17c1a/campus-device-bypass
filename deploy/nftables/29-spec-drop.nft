@@ -1,0 +1,14 @@
+# 特定网段硬 DROP（示例：iif 受管网段，目的集按你的环境填）：
+# 校园网场景里某些网段只承载认证/计费或已知检测流量，不应出境。
+# 参考形态：
+#
+# set drop_nets {
+# 	type ipv4_addr
+# 	flags interval
+# 	elements = { }
+# }
+#
+# chain spec_drop {
+# 	type filter hook prerouting priority filter; policy accept;
+# 	iifname "br-iot" ip daddr @drop_nets counter drop comment "spec-drop"
+# }

@@ -2,7 +2,7 @@
 # wxdet-gate —— 前置分流门（TCP :12347 + UDP :12348）
 #
 # nftables 把受管网段的 TCP 重定向进来（deploy/nftables/30-gate-redir.nft），
-# STUN / UDP 80 / UDP 8080 经 DNAT 进 UDP 门（31-gate-udp.nft）。
+# 公网 UDP 全量经 TPROXY 进 UDP 门（31-gate-udp.nft；DNAT 已退役）。
 # 本进程 peek 首包二判：标准 TLS/明文下载特征判 pass，转交下游普通入口；
 # 其余一切判 proxy，进代理（fail-closed）。
 #

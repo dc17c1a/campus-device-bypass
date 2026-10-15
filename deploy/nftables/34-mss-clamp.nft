@@ -1,0 +1,16 @@
+# MSS 双向钳制：
+# 出向 SYN 按路由 MTU 钳（postrouting，覆盖本机发起 + 转发）；回程 SYN-ACK 在
+# forward 钩钳。只改出向不改入向会在对端 MTU 变小时复现 DF 丢包。
+# `tcp flags syn / syn,rst` ≡ iptables `--tcp-flags SYN,RST SYN`
+# （SYN 置位且 RST 未置位，覆盖 SYN 与 SYN-ACK）。
+# 上行走出境口（本部署 wan 口为空），故挂 oifname/iifname 出境接口而非 wan。
+# 现 MTU 1500 → 钳出 1460，与内核默认值一致，平时是 no-op，只防未来 MTU 变小
+# （PPPoE/隧道）时的 DF 丢包与 MSS 离散。IPv6 出境已全 drop，不管 v6。
+chain mss_clamp_out {
+	type filter hook postrouting priority mangle; policy accept;
+	oifname "br-lan" tcp flags syn / syn,rst counter tcp option maxseg size set rt mtu comment "mss-clamp-out"
+}
+chain mss_clamp_in {
+	type filter hook forward priority filter; policy accept;
+	iifname "br-lan" tcp flags syn / syn,rst counter tcp option maxseg size set rt mtu comment "mss-clamp-in-fwd"
+}

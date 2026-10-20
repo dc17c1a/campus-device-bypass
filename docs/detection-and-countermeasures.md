@@ -202,8 +202,9 @@ iptables -t nat -I PREROUTING -p udp --dport 123 -j ntp_force_local
   让 DPI 侧的首包切分错位；真实连接的内容不改。
   覆盖范围按全端口生效，不按端口猜 —— 非 80/443 端口一样跑 TLS。
 - **教训**：fake SNI 按进程/档固定，别把"随机 SNI"当强对抗手段宣传；
-  desync 曾静默失效（queue 旁路无报错），queue 规则内嵌 `counter` 是唯一生效判据。
-- 本仓库实现：`deploy/ua3f/ua3f.example`（`desync_reorder*`）+ `deploy/nftables/36-pkg-proxy.nft` 同类入队形态按需取用。
+  desync 曾静默失效（queue 旁路无报错）；入队规则由 ua3f 运行时创建
+  （非常驻文件），以其 `counter` 是否增长为唯一生效判据。
+- 本仓库实现：`deploy/ua3f/ua3f.example`（`desync_reorder*`）。
 
 ### 3.11 MAC 与认证策略
 - WAN 口克隆已认证设备 MAC + 固定静态 IP；意外封锁的自愈（失败探针 → 换 MAC/
@@ -232,7 +233,7 @@ iptables -t nat -I PREROUTING -p udp --dport 123 -j ntp_force_local
 | NTP | UDP 123 劫持到本机 | `deploy/nftables/33-dns-ntp.nft` + `system.ntp.enable_server` |
 | DNS/DoH 画像 | 53 劫持到 dnsmasq→DoH；TCP/UDP 853 reject；DoH 名单封堵由下游代理执行（gate 当前版本不判 block；现网瘦身后下游 block 规则亦删，53 劫持与 DoH 上游仍在） | `33-dns-ntp.nft` + `lists/doh-*.example` |
 | JA3/DPI 应用特征 | 有账号价值的流量（微信/QQ/抖音/游戏/私有协议）全部进代理 | gate 判定（`proxy`） + 下游 `proxy` 组（示例见 `deploy/sing-box/example.json`） |
-| SNI / 明文 HTTP 首包特征（被动 DPI） | 出口 TCP 前 2KB/前 8 包由 ua3f reorder（全端口），queue 规则带 `counter` 自证生效 | ua3f（`deploy/ua3f/ua3f.example`，`desync_reorder=1`） |
+| SNI / 明文 HTTP 首包特征（被动 DPI） | 出口 TCP 前 2KB/前 8 包由 ua3f reorder（全端口；入队规则运行时创建，以其 `counter` 增长自证生效） | ua3f（`deploy/ua3f/ua3f.example`，`desync_reorder=1`） |
 | UDP 会话/STUN | STUN 统一进 gate 判定并中继，非 STUN 才直连 | `deploy/nftables/31-gate-udp.nft` + `gate/src/udp.rs` |
 | QUIC 绕过代理链 | `udp/443` reject 逼回 TCP | `32-egress-fingerprint.nft`（`iot_quic_block`） |
 | 私有心跳（客户端类） | 不在本仓库范围（认证层问题） | 另见 §6 的第三方客户端项目 |

@@ -1,0 +1,24 @@
+[package]
+name = "wxdet-gate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[[bin]]
+name = "wxdet-gate"
+path = "src/main.rs"
+
+[[bin]]
+name = "send_flow"
+path = "src/bin/send_flow.rs"
+
+[dependencies]
+tokio = { version = "1.53", features = ["rt-multi-thread", "net", "time", "signal", "sync", "io-util", "macros"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

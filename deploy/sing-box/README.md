@@ -8,7 +8,8 @@
 | tag | 端口 | 作用 |
 |---|---|---|
 | `socks` | `127.0.0.1:10808` | 通用 SOCKS5/mixed：本机排障/管理入口（`curl -x socks5h://127.0.0.1:10808 ...`）；gate 的 `pass` 默认直拨 `:18081`，不经这里（可改 `WD_PASS_SOCKS` 接入） |
-| `proxy-in` | `127.0.0.1:10811` | **gate 判 `proxy` 专用**：gate 的 fail-closed 拨号目标，只监听 loopback（与现网同端口，tag 名按你的配置） |
+| `proxy-in` | `127.0.0.1:10811` | **gate 判 `proxy` 专用**：gate 的 fail-closed 拨号目标，只监听 loopback |
+| `pkg` | `127.0.0.1:10813` | 本机软件源透明代理（redirect，`SO_ORIGINAL_DST` 取真目的；见 `deploy/nftables/36-pkg-proxy.nft` 形态，按需取用） |
 
 ## 出站
 
@@ -16,10 +17,12 @@
 |---|---|
 | `direct` | 直连 |
 | `via-ua3f` | 经本机 ua3f SOCKS5（`127.0.0.1:18081`）出口，统一 UA/L3 指纹 |
-| `lx` | 远程隧道节点示例（VLESS+TLS，`tunnel.example.com:8443` 占位，换你自己的节点） |
-| `lx2` | 第二条远程腿占位（同 `tunnel.example.com`，端口/uuid 都是占位）—— 故障转移要有第二条腿才有意义，换成你的第二个节点 |
-| `proxy` | `urltest` 出口组：在 `lx`/`lx2` 等远程腿间按延迟选路、故障转移；gate 与路由规则都只引用组名（示例两条腿，按你的节点补齐成员） |
-| `block` | 阻断（加密 DNS 封堵等） |
+| `realm` | 本机 hysteria 隧道 SOCKS（`127.0.0.1:18082`），hezi 组第四腿 |
+| `lx` | 远程隧道节点示例（VLESS+TLS，`tunnel.example.com:443` 占位，换你自己的节点） |
+| `lx2` | 第二条远程腿占位（同 `tunnel.example.com:8443`，端口/uuid 都是占位） |
+| `tw` | 第三条远程腿占位（同上）—— 三条 VLESS 腿 + `realm` 共四腿，故障转移才有意义 |
+| `proxy` | `urltest` 出口组：在 `lx`/`lx2`/`tw`/`realm` 间按延迟选路、故障转移；gate 与路由规则都只引用组名（按你的节点补齐成员） |
+| `block` | 阻断（当前无规则指向，保持空闲） |
 
 > 实际部署的隧道腿使用 XHTTP 传输 + ECH + VLESS 后量子 `encryption`
 > （需要支持这些特性的 sing-box fork / 自编译版本）；示例为兼容性起见用
@@ -28,7 +31,7 @@
 
 ## 路由顺序（语义关键，改规则务必保持；与现网四规则一致）
 
-1. **`inbound == proxy-in` → `proxy` 必须排最前**：gate 已经做完判定，
+1. **`inbound == proxy-in/pkg` → `proxy` 必须排最前**：gate 已经做完判定，
    不能被后续规则截走（现网无 `sniff` 规则，它就在第一位）。
 2. 私网段 → `direct`（不进隧道）。
 3. 本地域名（占位）→ `direct`（本地解析保护，按你的内网域替换）。
@@ -38,6 +41,7 @@
 历史形态（早期部署曾有，已瘦身删除；`example.json` 不再保留）：
 DoH/QUIC block、tcp/443 单独规则、下载站与 STUN 端口早位规则、业务域名→proxy。
 下载站归 gate 名单（`lists/dl-*`）、STUN 归 gate UDP 门，gate 为唯一判点。
+hezi 组曾为 `lx/lx2/tw/us`，现第四腿为 `realm`（`us` 已删）。
 
 ## 部署
 

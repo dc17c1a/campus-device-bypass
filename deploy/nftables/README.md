@@ -13,6 +13,7 @@ fw4 的具名 set/链）。文件编号即加载顺序，可自行改名，链�
 | `33-dns-ntp.nft` | DNS 收敛（53 劫持、TCP/UDP 853 拒绝）与 NTP 劫持 |
 | `34-mss-clamp.nft` | MSS 双向钳制（出向按路由 MTU + 回程 forward） |
 | `35-observe.nft` | 纯观测方法（port80 归属计数 + RST 注入观测，只计数） |
+| `36-pkg-proxy.nft` | 本机软件源透明代理（可选，redirect `:10813`，按需取用） |
 
 ## 使用与注意事项
 

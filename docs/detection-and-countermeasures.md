@@ -177,6 +177,8 @@ iptables -t nat -I PREROUTING -p udp --dport 123 -j ntp_force_local
   单账号并发过大（>100–500）仍会被行为检测抓。
 - 本仓库的主角就是这个环节：**gate 决定哪些流量必须进隧道**，
   下游代理负责其余流量的精细分流（直连/改写/隧道）。
+- 实现教训：gate 曾因 FD 耗尽断流（FIN_WAIT2/CLOSE_WAIT 常驻打满 1024），
+  现启动自抬 NOFILE 到 65535、TCP 中继空闲 300s 收尾、EMFILE 时 accept 退避。
 
 ### 3.8 DHCP / DNS 收敛
 - DNS 全劫持到 dnsmasq，dnsmasq 上游走 DoH；关 RA 多余 RDNSS；DHCP 只下发
@@ -189,27 +191,19 @@ iptables -t nat -I PREROUTING -p udp --dport 123 -j ntp_force_local
   统一全家出口的 TLS 客户端栈；UA 与指纹对齐（UA 声称 Chrome、指纹是 Go = 自爆）。
 - 验证：`tls.peet.ws` 之类回显站点对比浏览器与代理出口。
 
-### 3.10 出口 DPI 脱敏（TCP desync）
+### 3.10 出口 DPI 脱敏（TCP desync，由 ua3f 承担）
+
+> 注：独立 `zapret`/nfqws 方案已退役并删除：fake 包曾毒化近端游戏前置导致登录失败。
+
 - **对手**：被动 DPI 读首包明文特征 —— TLS ClientHello 里的 SNI、明文 HTTP 的
   方法行/Host/UA。加密本身解决不了：握手阶段这些字段本来就是明文。
-- **做法**：把首包（连同回包握手散件）送 NFQUEUE，由 nfqws 注入伪造分片/乱序/
-  坏序列，让 DPI 侧的首包切分错位、拼不出真实 SNI；真实连接的内容不改。
-  覆盖范围要**按协议识别**（`--filter-l7=tls`）而不是按端口猜 —— 非 80/443 端口
-  一样跑 TLS，只在 80/443 脱敏等于把缺口留在别的端口上。
-- **两条实测教训**（在作者验证过的 nfqws 构建/版本上；此类行为随版本会变）：
-  1. fake 载荷的随机化粒度**不均匀**：载荷里的随机字段（session_id 之类）默认
-     逐包随机，但 fake ClientHello 的 **SNI 域名是每个 profile 在进程启动时生成
-     一次**，此后该档所有连接复用同一个域名（`www.microsoft.com` 只是 nfqws 的
-     内置模板名，链路上实际出现的是随机域名）。所以**别把"随机 SNI"当强对抗手段
-     宣传** —— 它不是每包一换。
-  2. `--dpi-desync-fake-tls-mod=rndsni` 并不给出"逐包随机 SNI"：在验证过的构建上
-     它不生效，还会把默认的逐包随机字段一起冻住（同档 fake CH 载荷逐字节全同），
-     属于**回退**，已撤回。别按"逐包随机 SNI"来理解这个开关。
-- **desync 会静默失效**：nfqws 不在或 queue 规则丢了时，`queue flags bypass` 让包
-  照常通过、一条都不改，且**没有任何报错**。因此 (a) queue 规则内嵌 `counter` 的
-  `packets` 是"脱敏到底有没有生效"的唯一判据（`packets` 不涨就是没生效）；
-  (b) 需要一个幂等的看护脚本兜底（缺表补表、缺进程补进程，正常态零日志）。
-- 本仓库实现：`deploy/zapret/`（nfqws 三档 + nft 入队表 + `zapret_guard.sh` 看护）。
+- **做法**：出口 TCP 前 2KB/前 8 包送 NFQUEUE，由 ua3f 做 reorder
+ （`reorder=1/bytes=2000/packets=8`，全端口，`inject=0`，MitM 关），
+  让 DPI 侧的首包切分错位；真实连接的内容不改。
+  覆盖范围按全端口生效，不按端口猜 —— 非 80/443 端口一样跑 TLS。
+- **教训**：fake SNI 按进程/档固定，别把"随机 SNI"当强对抗手段宣传；
+  desync 曾静默失效（queue 旁路无报错），queue 规则内嵌 `counter` 是唯一生效判据。
+- 本仓库实现：`deploy/ua3f/ua3f.example`（`desync_reorder*`）+ `deploy/nftables/36-pkg-proxy.nft` 同类入队形态按需取用。
 
 ### 3.11 MAC 与认证策略
 - WAN 口克隆已认证设备 MAC + 固定静态 IP；意外封锁的自愈（失败探针 → 换 MAC/
@@ -238,8 +232,8 @@ iptables -t nat -I PREROUTING -p udp --dport 123 -j ntp_force_local
 | NTP | UDP 123 劫持到本机 | `deploy/nftables/33-dns-ntp.nft` + `system.ntp.enable_server` |
 | DNS/DoH 画像 | 53 劫持到 dnsmasq→DoH；TCP/UDP 853 reject；DoH 名单封堵由下游代理执行（gate 当前版本不判 block；现网瘦身后下游 block 规则亦删，53 劫持与 DoH 上游仍在） | `33-dns-ntp.nft` + `lists/doh-*.example` |
 | JA3/DPI 应用特征 | 有账号价值的流量（微信/QQ/抖音/游戏/私有协议）全部进代理 | gate 判定（`proxy`） + 下游 `proxy` 组（示例见 `deploy/sing-box/example.json`） |
-| SNI / 明文 HTTP 首包特征（被动 DPI） | 注入伪造分片/乱序/坏序列让首包切分错位；按 `l7=tls` 覆盖全端口 TLS，queue 规则带 `counter` 自证生效 | `deploy/zapret/`（nfqws 三档 desync + nft 入队表 + `zapret_guard.sh` 看护） |
-| UDP 会话/STUN | STUN 统一进 gate 判定并中继，非 STUN 才直连 | `deploy/nftables/31-gate-udp.nft` + `gate/udp.go` |
+| SNI / 明文 HTTP 首包特征（被动 DPI） | 出口 TCP 前 2KB/前 8 包由 ua3f reorder（全端口），queue 规则带 `counter` 自证生效 | ua3f（`deploy/ua3f/ua3f.example`，`desync_reorder=1`） |
+| UDP 会话/STUN | STUN 统一进 gate 判定并中继，非 STUN 才直连 | `deploy/nftables/31-gate-udp.nft` + `gate/src/udp.rs` |
 | QUIC 绕过代理链 | `udp/443` reject 逼回 TCP | `32-egress-fingerprint.nft`（`iot_quic_block`） |
 | 私有心跳（客户端类） | 不在本仓库范围（认证层问题） | 另见 §6 的第三方客户端项目 |
 

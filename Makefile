@@ -1,31 +1,29 @@
-# campus-device-bypass —— wxdet-gate 构建入口
-GO   ?= go
-BIN  := wxdet-gate
+# campus-device-bypass —— wxdet-gate 构建入口（Rust）
+CARGO ?= cargo
+BIN   := wxdet-gate
 
-.PHONY: all check fmt vet test build arm64 clean
+.PHONY: all check fmt clippy test build arm64 clean
 
 all: check build
 
-check: fmt vet test
+check: fmt clippy test
 
-# gofmt 只检查不改写：有未格式化文件即失败
+# cargo fmt 只检查不改写：有未格式化文件即失败
 fmt:
-	@out="$$(gofmt -l gate)"; \
-	if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
+	cd gate && $(CARGO) fmt --check
 
-vet:
-	cd gate && $(GO) vet ./...
+clippy:
+	cd gate && $(CARGO) clippy --all-targets -- -D warnings
 
 test:
-	cd gate && $(GO) test ./...
+	cd gate && $(CARGO) test -- --test-threads=1
 
 build:
-	cd gate && $(GO) build -o $(BIN) .
+	cd gate && $(CARGO) build --bins
 
-# 常见路由器平台（arm64），静态编译、去符号
+# 常见路由器平台（arm64），静态 musl（OpenWrt 现行二进制亦静态）
 arm64:
-	cd gate && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-		$(GO) build -trimpath -ldflags "-s -w" -o $(BIN)-arm64 .
+	cd gate && $(CARGO) build --release --target aarch64-unknown-linux-musl --bins
 
 clean:
-	rm -f gate/$(BIN) gate/$(BIN)-arm64
+	rm -rf gate/target

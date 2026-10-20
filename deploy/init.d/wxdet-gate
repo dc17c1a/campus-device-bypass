@@ -16,10 +16,11 @@ start_service() {
 	mkdir -p /tmp/wxdet
 	procd_open_instance
 	procd_set_param command /usr/bin/wxdet-gate
-	# 小内存设备（如 256–512MB 级路由器）：软内存上限 + 更积极的 GC，
-	# 防止 Go 运行时 RSS 冲高拖垮整机；数值可按设备内存调整。
-	# （本示例取 40/16MB，比某生产部署的 100/64MB 更保守，按设备内存调整。）
-	procd_set_param env GOGC=40 GOMEMLIMIT=16777216
+	# EMFILE 防护：TCP 中继空闲 300s 收尾 + accept 退避（代码侧）；
+	# procd 侧把 hard/soft 一起抬到 65535（gate 启动时另有自抬兜底）。
+	procd_set_param limits nofile="65535 65535"
+	# TCP 中继空闲超时（默认 300s，代码侧亦有默认值；此处显式声明防漂移）。
+	procd_set_param env WD_TCP_IDLE_SEC=300
 	# respawn <阈值秒> <窗口秒> <重试次数>：崩溃自动拉起
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 1

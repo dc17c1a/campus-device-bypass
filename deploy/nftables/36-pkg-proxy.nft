@@ -1,0 +1,19 @@
+# 本机软件源透明代理（可选，按需取用）：
+#
+# 路由器自身发往软件源域名的 TCP 80/443 重定向到 sing-box `:10813`
+# （redirect inbound，`SO_ORIGINAL_DST` 取回真目的，路由 `inbound=pkg`
+# 整条送隧道）。与调用者上下文无关，一次覆盖全部场景。
+# 域名→IP 由 dnsmasq 的 `config ipset` 段动态喂
+# （`table fw4 / set pkg_repo`），CDN 换 IP 自动跟随。
+# 起效前提：sing-box 在线；sing-box 不可用时连接被拒，不回落直连。
+#
+# 网段/域名按你的环境替换；不用时删除本文件即可。
+set pkg_repo {
+	type ipv4_addr
+	flags timeout
+}
+
+chain pkg_proxy_out {
+	type nat hook output priority dstnat; policy accept;
+	ip daddr @pkg_repo tcp dport { 80, 443 } counter redirect to :10813 comment "pkg-repo-to-singbox"
+}

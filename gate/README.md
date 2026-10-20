@@ -1,4 +1,4 @@
-# wxdet-gate（Go 前置分流网关）
+# wxdet-gate（Rust 前置分流网关）
 
 旁路网关的前置分流门。nftables 把受管网段的 TCP 重定向到 TCP `:12347`、
 公网 UDP 全量 TPROXY 到 UDP `:12348`；本进程 peek 首包判定，
@@ -28,21 +28,26 @@
 - UDP 下行源欺骗：握手期校验源的客户端会拒收非对端源的回包，gate 为每个
   assoc 建透明 socket 绑定对端地址回包，失败时降级为监听 socket（各记一个
   计数器，只降级一次）。
+- 资源防护：启动自抬 NOFILE 到 65535；EMFILE 时 accept 退避；
+  TCP 中继空闲 300s 收尾（`WD_TCP_IDLE_SEC`，防 FIN_WAIT2/CLOSE_WAIT 常驻打满 fd）。
 
-构建与部署：
+构建与部署（Rust，依赖 `tokio` + `libc`）：
 
 ```sh
 cd gate
-gofmt -l . && go vet ./... && go test ./...
-GOOS=linux GOARCH=arm64 go build -o wxdet-gate .
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test -- --test-threads=1
+cargo build --release --target aarch64-unknown-linux-musl --bins
 # 覆盖运行中的二进制不能直接 scp 到目标路径（ETXTBSY）：
 # 先传到 /tmp 再停服务替换，精确找 pid 看二进制 exe 链接：
 # for p in /proc/[0-9]*; do [ "$(readlink $p/exe)" = "/usr/bin/wxdet-gate" ] && echo ${p#/proc/}; done
 ```
 
-## 加固要点（审查后修复）
+注意：`cargo test` 必须带 `--test-threads=1`（测试共享进程级句柄，串行化是定案，
+并行必 flake，不是待修 bug）。
 
-- **TCP 本机目的守卫**：`handleConn` 在 origdst 之后判本机地址
+## 加固要点
+
+- **TCP 本机目的守卫**：origdst 之后判本机地址
   （loopback/private/link-local/unspecified，与 UDP 同口径），命中即
   drop + `gate_tcp_local_drop`。没有它时本机进程直连监听口会形成自连风暴
   直到 `too many open files`。**不做端口判断**。
@@ -54,8 +59,8 @@ GOOS=linux GOARCH=arm64 go build -o wxdet-gate .
   支持 **pass→proxy 单向升级**（失败计数且保持原腿）；封装决策在 `send`
   的锁内完成（换腿窗口不许把裸载荷写进代理的 SOCKS5-UDP socket）；
   错误日志每进程限速。
-- 其他：`socks5Dial` 校验回复；`logGate` 只渲染前 24B hex；`classifyEx`
-  为纯函数，统计副作用留在 `classify` 包装层。
+- 其他：SOCKS5 拨号校验回复；`gate.log` 只渲染前 24B hex；判路为纯函数，
+  统计副作用留在包装层。
 
 观测：`tail gate.log`（assoc/`verdict=`），`tail -3 stats.tsv`。
 直连面（`pass`/`tls_direct`）不进事件流（体量最大），改走**聚合台账**：字节/时长
@@ -68,7 +73,7 @@ Range 只判有无，强弱只做计数不改判路）。
 ## fail-closed（行为 + 用例钉死）
 
 出站决策点收拢成单函数：`proxy`→代理入口、`pass`→下游普通入口，
-**每个 verdict 只拨一跳**；失败即返回 `nil`（客户端断流），只记失败计数
+**每个 verdict 只拨一跳**；失败即断流，只记失败计数
 并落 `err` 事件。回归测试钉死两条：代理入口回失败、普通入口回失败都必须
 不断第二腿（另带正常时真走对应入口的正控），反向验证（把失败分支改成
 回退另一腿，用例立刻转红）。

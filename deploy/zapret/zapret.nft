@@ -1,8 +1,12 @@
-# zapret 独立 desync 表（NFQUEUE，TCP 80/443）。
+# zapret 独立 desync 表（NFQUEUE，全 TCP；端口白名单在 nfqws 侧）。
 #
-# 机制：出口 TCP 80/443 的前若干包 + 回包握手散件送 NFQUEUE，由 nfqws 做
-# 伪造分片/乱序/坏序列脱敏（防 SNI 与明文特征识别）；已脱敏连接打内部标记，
-# 后续包与豁免目的直接放行，established 后零开销。
+# 机制：出口 TCP 的**前若干包**（不按端口挑，见下）+ 回包握手散件送 NFQUEUE，
+# 由 nfqws 做伪造分片/乱序/坏序列脱敏（防被动 DPI 读首包明文 SNI/HTTP 特征）；
+# 已脱敏连接打内部标记，后续包与豁免目的直接放行，established 后零开销。
+#
+# 为什么出向不按端口挑：非 80/443 端口一样跑 TLS（SNI 同样明文可读），只在
+# 80/443 脱敏等于把缺口留在其它端口上。端口维度改由 nfqws 侧的 --filter-tcp
+# 与 --filter-l7=tls 决定 —— 按协议识别比按端口猜准。
 #
 # 部署位置：/etc/zapret.nft（注意：不可放 /etc/nftables.d/ —— fw4 会把该目录
 # include 进 `table inet fw4` 上下文，嵌套 table 语法错误会导致 fw4 启动失败）。
@@ -20,12 +24,12 @@ table inet zapret {
 
 	chain postnat_hook {
 		type filter hook postrouting priority srcnat + 1; policy accept;
-		# 管理/SSH 与自家隧道端口直接放行
+		# 管理/SSH 与自家隧道端口直接放行（按你的环境补全，例如 { 22, <管理端口>, <隧道端口> }）
 		oifname "br-lan" tcp dport { 22 } return
 		# 隧道端点豁免 desync
 		ip daddr @nozapret return
-		# 出向 80/443 仅前若干包进队（conntrack 计数）
-		oifname "br-lan" meta mark & 0x40000000 == 0x00000000 tcp dport { 80, 443 } ct original packets 0-6 queue flags bypass to 200
+		# 出向 TCP 全量：前若干包进队（conntrack 计数），端口白名单在 nfqws 侧
+		oifname "br-lan" meta mark & 0x40000000 == 0x00000000 ct original packets 0-6 counter queue flags bypass to 200 comment "queue-all-tcp-egress"
 		# 已打标连接记 ct mark，后续包免二次改写
 		meta mark & 0x40000000 != 0x00000000 ct mark set ct mark | 0x40000000
 	}
@@ -34,12 +38,21 @@ table inet zapret {
 		type filter hook prerouting priority filter; policy accept;
 		# 隧道端点回包豁免
 		ip saddr @nozapret return
-		# 回程 80/443：前若干包 + 握手/结束散件进队（双向 desync 才生效）
-		iifname "br-lan" tcp sport { 80, 443 } ct reply packets 0-3 queue flags bypass to 200
-		iifname "br-lan" tcp sport { 80, 443 } tcp flags syn,ack queue flags bypass to 200
-		iifname "br-lan" tcp sport { 80, 443 } tcp flags fin,rst queue flags bypass to 200
+		# 回包按 conntrack 方向判定（ct direction reply），而不是猜服务端端口：
+		# 服务端端口是任意值，只有方向是连接属性。
+		#
+		# 为什么三条都显式写 ct direction reply：ct reply packets 是**连接级的
+		# 回包计数，与当前这个包的方向无关**。放宽到全 TCP 后，客户端刚发请求时
+		# 该连接的回包计数只有 1（仅 SYN-ACK），于是原始方向（客户端→路由器）的包
+		# 也会命中入队；nfqws 把"发给路由器本机 80 端口的 HTTP 请求"当成对外请求
+		# 处理，注入假载荷 + 按 method+2 切片，路由器 ACK 了 264B 而客户端只发了
+		# 98B，客户端判为非法 ACK、丢掉该连接的一切响应段 —— 表现为"握手 0.01s
+		# 成功，但 0 字节、永久转圈"。锁上方向后只有真正的连接回包进队。
+		iifname "br-lan" ct direction reply meta l4proto tcp ct reply packets 0-3 counter queue flags bypass to 200 comment "queue-reply-0-3-all"
+		iifname "br-lan" ct direction reply meta l4proto tcp tcp flags syn,ack counter queue flags bypass to 200 comment "queue-reply-synack-all"
+		iifname "br-lan" ct direction reply meta l4proto tcp tcp flags fin,rst counter queue flags bypass to 200 comment "queue-reply-finrst-all"
 		# autottl 探针副作用：带标连接的 time-exceeded 回包直接丢弃
-		iifname "br-lan" icmp type time-exceeded ct mark & 0x40000000 != 0x00000000 drop
+		iifname "br-lan" icmp type time-exceeded ct mark & 0x40000000 != 0x00000000 counter drop comment "zapret-fake-icmp-drop"
 	}
 
 	chain predefrag {

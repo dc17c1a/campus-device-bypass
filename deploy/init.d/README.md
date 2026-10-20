@@ -5,7 +5,7 @@
 # | `iot-tproxy` | 18 | TPROXY 策略路由（fwmark 0x100 → 本地投递） |
 # | `ipidfix` | 20 | DF 包 IPID 归零独立表 |
 # | `wxdet-gate` | 94 | 前置分流门（TCP :12347 + UDP :12348） |
-# | `zapret` | 98 | 出口 TCP 80/443 NFQUEUE 脱敏（在下游代理之前） |
+# | `zapret` | 98 | 出口 TCP 全量 NFQUEUE 脱敏（在下游代理之前） |
 # | `sing-box` | 99 | 下游代理核心（种子自恢复 + 先 check 后 run） |
 # | `ua3f` | 99 | 指纹整理（同二进制可起第二实例） |
 #

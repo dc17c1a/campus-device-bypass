@@ -3,11 +3,14 @@
 # 方法1——TCP 80  bulk 归属：postrouting 上 TCP dport 80 设 total 分母 counter
 # （裸 counter 在前、命中后继续遍历）+ 落到关注网段的 game 分子 counter
 # （counter accept 在后）。顺序不可换（同链内 accept 终止遍历）。
-# 无 saddr 限定是有意的：下游代理出境源为本机，加网段源限定会漏掉正主要求测的量。
+# 无 saddr 限定是有意的：下游代理出境源为本机，加受管网段源限定会漏掉正主要求测的量；
+# 但**接口要限定**（`oifname "br-lan"`，见下）——限定的对象是"从往上游这条链路出去"，
+# 与"源地址是不是受管网段"是两回事，两者并存不冲突。
 # 生效不要 fw4 reload（清零全部计数器）——文件持久化 + live 点加。
 #
 # 方法2——上游 RST 注入观测（GoodbyeDPI 被动思想移植）：prerouting 上统计
-# 入境 established RST 总量（total）与其中 ip id<=1 的疑似注入量（suspect）。
+# 入境（`iifname "br-lan"`）established RST 总量（total）与其中 ip id<=1 的疑似
+# 注入量（suspect）。接口限定把非上行方向的包排除在分子分母之外。
 # established 限定保住建连失败快速语义；suspect 占比显著高于 DF 本底、
 # 且排除认证流误伤后，可把 suspect 规则尾加 drop 转为执法。
 # 参考形态（set 内容替换为你的关注网段）：
@@ -20,12 +23,12 @@
 #
 # chain port80_observe {
 # 	type filter hook postrouting priority mangle + 5; policy accept;
-# 	tcp dport 80 counter comment "port80-total"
-# 	ip daddr @bulk_nets tcp dport 80 counter accept comment "port80-subset"
+# 	oifname "br-lan" tcp dport 80 counter comment "port80-total"
+# 	oifname "br-lan" ip daddr @bulk_nets tcp dport 80 counter accept comment "port80-subset"
 # }
 #
 # chain rst_inject_observe {
 # 	type filter hook prerouting priority filter; policy accept;
-# 	tcp flags rst ct state established counter comment "rst-inbound-established-total"
-# 	tcp flags rst ip id <= 1 ct state established counter comment "rst-inject-suspect"
+# 	iifname "br-lan" tcp flags rst ct state established counter comment "rst-inbound-established-total"
+# 	iifname "br-lan" tcp flags rst ip id <= 1 ct state established counter comment "rst-inject-suspect"
 # }

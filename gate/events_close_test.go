@@ -39,7 +39,7 @@ func TestEventsCloseLong(t *testing.T) {
 	p := tempEvents(t)
 	src := "192.168.2.50:40002"
 	od := dstAddr{ip: net.ParseIP("1.2.3.4"), port: 443}
-	emitCloseEvent("tcp", src, od, "xray", "dl_direct", 60001, 0, 0, "server")
+	emitCloseEvent("tcp", src, od, "proxy", "dl_direct", 60001, 0, 0, "server")
 	lines := readLines(t, p)
 	if len(lines) != 1 {
 		t.Fatalf("long close must emit 1 line, got %d", len(lines))
@@ -55,7 +55,7 @@ func TestEventsCloseLong(t *testing.T) {
 		t.Fatalf("dur>60000 must have long=1: %v", m)
 	}
 	// 边界：60000 不加 long。
-	emitCloseEvent("tcp", src, od, "xray", "dl_direct", 60000, 0, 0, "server")
+	emitCloseEvent("tcp", src, od, "proxy", "dl_direct", 60000, 0, 0, "server")
 	lines2 := readLines(t, p)
 	// p 已有 1 行 long，再加 1 行边界行，共 2 行；最后一行无 long。
 	if len(lines2) != 2 {

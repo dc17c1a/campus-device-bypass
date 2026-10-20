@@ -11,7 +11,7 @@ func TestEventsErrorLine(t *testing.T) {
 	p := tempEvents(t)
 	src := "192.168.2.50:43000"
 	od := dstAddr{ip: net.ParseIP("203.0.113.7"), port: 8081}
-	emitErrorEvent("tcp", src, od, "err", "oicq_proxy_fail", "dial tcp 127.0.0.1:18082: connect: connection refused")
+	emitErrorEvent("tcp", src, od, "err", "oicq_proxy_fail", "dial tcp 127.0.0.1:18081: connect: connection refused")
 	lines := readLines(t, p)
 	if len(lines) != 1 {
 		t.Fatalf("error must emit 1 line, got %d", len(lines))

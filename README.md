@@ -89,8 +89,8 @@ flowchart TB
             direction LR
             GU["取真目的 udpVerdict"]
             GS["STUN 形状命中<br/>任意端口判 proxy"]
-            GL["非 STUN 目的口 ≤10000<br/>判 proxy"]
-            GH["非 STUN 目的口 >10000 / 短包<br/>判 pass，直拨回源"]
+            GL["非 STUN 目的口 ≤10000（含短包）<br/>判 proxy"]
+            GH["非 STUN 目的口 >10000（含短包）<br/>判 pass，直拨回源"]
             GUD["本机私网目的丢弃"]
         end
         GF["fail-closed<br/>拨号/中继失败即断流<br/>不改拨第二腿"]
@@ -114,10 +114,10 @@ flowchart TB
         FP["TTL 三处 / IPID 双机制<br/>MSS 双向 / ICMP 伪装"]
     end
 
-    subgraph ZAP["六 zapret（出口 TCP 80/443 NFQUEUE 脱敏）"]
+    subgraph ZAP["六 zapret（出口全 TCP NFQUEUE 脱敏，端口白名单在 nfqws 侧）"]
         direction LR
-        ZQ["进队规则<br/>出向首包 + 回包握手散件<br/>管理端口与豁免目的放行"]
-        ZN["nfqws 脱敏<br/>伪造分片 / 乱序 / 坏序列<br/>打标豁免不二次改写"]
+        ZQ["进队规则<br/>出向全 TCP 首包 0-6 进队<br/>回包按 conntrack reply 方向进队（0-3 + 握手/结束散件）<br/>管理端口与豁免目的放行"]
+        ZN["nfqws 脱敏（三档）<br/>80 档按方法切分 / 443 档乱序 + autottl<br/>其余 TLS 按 l7 切分<br/>打标豁免不二次改写"]
         ZX["豁免回流<br/>已脱敏包直接放行"]
     end
 
@@ -189,12 +189,14 @@ flowchart TB
 
 ### 2.3 出口
 
-- **代理流量**：gate 拨到下游 `proxy` 组（示例：本机 hysteria2 腿 + 远程
-  VLESS 腿，urltest 自动选路与故障转移），从自建节点封包出境。
+- **代理流量**：gate 拨到下游 `proxy` 组（示例：多腿远程节点，VLESS/anytls 等，
+  urltest 自动选路与故障转移），从自建节点封包出境。
 - **转交/改写流量**：下游 `direct` 直发；`via-ua3f` 经本机 ua3f SOCKS5
   重建连接（UA 归一 + L3 指纹复写）后发出。
 - **出口前统一处理**：出 `br-lan` 前 nft 统一 TTL/IPID、ICMP 伪装；
-  本机发起的 TCP SYN 还过 ua3f 的 NFQUEUE 钩子做 TCP 指纹整理。
+  出口的 TCP SYN 还会过 ua3f 自带的 NFQUEUE 钩子做 TCP 层指纹整理（入队范围
+  与队列号由 ua3f 自己管理，见上游文档）。要注意让这个钩子豁免 zapret 打过标的
+  包，否则两套改写会互相干扰。
 
 ## 3. wxdet-gate 工作原理
 
@@ -271,7 +273,9 @@ flowchart TB
 - `gate.log`：每条连接一行 JSON（`ts/src/dst/verdict/reason/first`，`first` 为首包
   前 24 字节 hex）。
 - `stats.tsv`：`unix_ts <tab> 计数键 <tab> 值` 的追加计数（`gate_conn`、
-  `gate_proxy`、`gate_proxy_fail`、`gate_rsn_<reason>`、`gate_udp_assoc` 等）。
+  `gate_proxy`、`gate_proxy_fail`、`gate_rsn_<reason>`、`gate_udp_assoc` 等；
+  直连面聚合台账另出 `gate_tlsdirect_close`/`gate_tlsdirect_up_B`/
+  `gate_tlsdirect_down_B`/`gate_tlsdirect_dur_ms` 四键）。
 - `events.jsonl`：统一事件流，字段如下：
 
 | event | 字段 |
@@ -283,6 +287,9 @@ flowchart TB
 
 > `pass/tls_direct` 这类大流量普通连接只进 `stats.tsv` 计数、不进 open/close 事件流，
 > 避免观测文件被冲爆（error 事件照进：`pass` 腿拨号失败会落 `err` 行）。
+> 它的字节与时长改走**聚合台账**：累计后每分钟增量刷进 `stats.tsv`
+> （`gate_tlsdirect_close`/`up_B`/`down_B`/`dur_ms`，按 key 求和即得总量与均时长），
+> 无流量时一行都不写；进程被杀最坏丢一分钟增量。
 
 ## 4. 快速开始
 
@@ -294,8 +301,9 @@ flowchart TB
 依赖组件（都可替换）：
 
 - 下游代理套件（示例：[sing-box](https://github.com/SagerNet/sing-box)）：提供普通/敏感入口、路由与出口组；
-- 一条加密隧道（示例：本机 hysteria2 客户端 + 远程 VLESS 节点）；
+- 一条加密隧道（示例：远程 VLESS / anytls 节点，多腿 urltest 选路）；
 - [UA3F](https://github.com/SunBK201/UA3F)（可选但推荐）：UA/L3 指纹归一；
+- [zapret](https://github.com/bol-van/zapret) / nfqws（可选但推荐）：出口全 TCP 的 DPI 脱敏；
 - nftables（fw4）、dnsmasq、https-dns-proxy 等 OpenWrt 原生件。
 
 ### 4.2 编译与安装
@@ -313,6 +321,9 @@ ssh root@<router> 'chmod 755 /etc/init.d/wxdet-gate && /etc/init.d/wxdet-gate en
 scp lists/dl-domains.example   root@<router>:/etc/wxdet/dl-domains.txt
 # …其余文件同理，见 lists/README.md
 ```
+
+注意：gate 在运行时不能直接 `scp` 覆盖 `/usr/bin/wxdet-gate`（ETXTBSY，首次装
+没事、二次升级会踩），先传 `/tmp` 再停服务替换，见 [gate/README.md](gate/README.md)。
 
 ### 4.3 nftables 接入
 
@@ -345,10 +356,24 @@ sing-box check -c /etc/sing-box/config.json
 ### 4.5 ua3f 接入（可选但推荐）
 
 `deploy/ua3f/ua3f.example` 给出"作为 SOCKS5 上游 + L3 指纹整理"的配置形态
-（UA 全量归一、去时间戳、窗口统一等）。UA3F 自带 NFQUEUE 钩子会处理本机发起的
-TCP SYN，安装方式见上游文档。
+（UA 全量归一、去时间戳、窗口统一等）。UA3F 自带 NFQUEUE 钩子会处理出口的
+TCP SYN（入队范围与队列号由 ua3f 自己管理），安装方式见上游文档。
 
-### 4.6 验证
+### 4.6 zapret 接入（可选但推荐）
+
+`deploy/zapret/` 承担出口全 TCP 的 DPI 脱敏（desync 只由它做，ua3f 的 desync
+开关保持关闭）：
+
+- `zapret.nft` → `/etc/zapret.nft`。**不能**放 `/etc/nftables.d/`：会被 include 进
+  `table inet fw4` 上下文，嵌套 table 语法错误会让下次 fw4 启动失败；
+- `zapret.config.example` → `/etc/config/zapret`（去掉 `.example`），策略只改这份；
+- `zapret_guard.sh` → `/root/zapret_guard.sh`（cron 每分钟），`init.d/zapret` →
+  `/etc/init.d/zapret`（表恢复 + 端点豁免刷新）。
+
+`nozapret` 集必须填自家隧道端点 IP，否则 fake 包会打坏隧道。细节见
+[deploy/zapret/README.md](deploy/zapret/README.md)。
+
+### 4.7 验证
 
 ```sh
 # 1) gate 起来了 / 名单加载
@@ -362,7 +387,7 @@ ssh root@<router> 'nft list chain inet fw4 iot_redir; nft list chain inet fw4 io
 curl -x socks5h://127.0.0.1:10808 -sS -o /dev/null -w '%{http_code}\n' https://example.com
 ```
 
-### 4.7 观测速查
+### 4.8 观测速查
 
 ```sh
 tail -f /tmp/wxdet/gate.log          # 逐连接 verdict/reason
@@ -428,7 +453,7 @@ gate 是纯转发进程，Go 运行时按小内存路由器调优（示例 `GOGC
 
 | 检测项 | 本方案对应 |
 |---|---|
-| TCP 80/443 DPI 脱敏 | `deploy/zapret/`：nfqws 伪造分片/乱序/坏序列 + 小 TTL 探针，只动首批包与握手散件，豁免标记免二次改写 |
+| 全 TCP DPI 脱敏 | `deploy/zapret/`：nfqws 伪造分片/乱序/坏序列，按 80 档 / 443 档 / 其余端口按 `l7=tls` 识别的兜底档分段；queue 规则带 `counter`，可判"是否真的生效" |
 | TTL | nft 出向改 64 + ua3f L3 重写 64；另有 zapret 小 TTL 探针（用途不同，不要混淆） |
 | IPID | nft 原子包置 0 + 独立 `ipidfix` 服务补 DF 包置 0（ua3f 该项保持关闭） |
 | MSS | `34-mss-clamp.nft`：出向按路由 MTU + 回程 forward 双向钳制 |
@@ -470,6 +495,8 @@ gate 是纯转发进程，Go 运行时按小内存路由器调优（示例 `GOGC
 | `gate_direct_udp` | `gate_pass_udp` | UDP 直拨 assoc 计数 |
 | `gate_hezi_udp`（含 `_fail`） | `gate_proxy_udp`（含 `_fail`） | UDP 中继 assoc 计数 |
 | `udp_upgrade_hezi_fail` | `udp_upgrade_proxy_fail` | 升级失败事件 reason |
+| `gate_tlsdirect_*`（台账四键） | 同名 | 直连面聚合台账（close/up_B/down_B/dur_ms），无需改名 |
+
 四份区域（`gate/`、`deploy/`、`lists/`、`docs/`）各自独立演进，改动建议附测试
 （`make` 会跑 gofmt/vet/test）。
 
@@ -477,7 +504,6 @@ gate 是纯转发进程，Go 运行时按小内存路由器调优（示例 `GOGC
 
 - [SagerNet/sing-box](https://github.com/SagerNet/sing-box) —— 代理核心与路由；
 - [SunBK201/UA3F](https://github.com/SunBK201/UA3F) —— UA/L3 指纹归一；
-- [apernet/hysteria](https://github.com/apernet/hysteria) —— 隧道实现之一；
 - [dibdot/DoH-IP-blocklists](https://github.com/dibdot/DoH-IP-blocklists)、
   [Sekhan/TheGreatWall](https://github.com/Sekhan/TheGreatWall) —— DoH 名单上游。
 

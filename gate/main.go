@@ -82,6 +82,7 @@ func main() {
 	}
 	log.Printf("wxdet-gate listening on %s (proxy=%s pass=%s peek=%s)", listenAddr, proxySocks, passSocks, peekWait)
 	go watchDLLists()
+	go startLedgerFlush(60 * time.Second)
 	if udpListenAddr != "" && udpListenAddr != "off" {
 		go serveUDP()
 	}
@@ -100,6 +101,17 @@ func main() {
 }
 
 func writeStat(key string, val int) {
+	if statFile == nil {
+		return
+	}
+	ioMu.Lock()
+	fmt.Fprintf(statFile, "%d\t%s\t%d\n", time.Now().Unix(), key, val)
+	ioMu.Unlock()
+}
+
+// writeStat64 给字节/时长这类量用。arm64 上 int 已是 64 位，单独一个函数是为了
+// 显式表达「这里可能是 int64 量级」，避免将来换 32 位平台时静默截断。
+func writeStat64(key string, val int64) {
 	if statFile == nil {
 		return
 	}
@@ -511,7 +523,7 @@ func watchDLLists() {
 }
 
 // httpMethods 方法行语义校验表：h2c 的 PRI * HTTP/2.0 不在表里，会穿过
-// 通判走 xray/default（手机 App 基本不用 h2c，记一笔不修）。
+// 通判走 proxy/default（手机 App 基本不用 h2c，记一笔不修）。
 var httpMethods = []string{"GET ", "POST ", "HEAD ", "PUT ", "OPTIONS ", "DELETE ", "PATCH ", "CONNECT "}
 
 // isHTTPRequest 方法行语义校验：首行以标准请求方法开头，挡随机二进制。
@@ -751,7 +763,13 @@ func relay(a, b *net.TCPConn, src string, od dstAddr, verdict, reason string, st
 	}
 	<-done
 	durMs := time.Since(start).Milliseconds()
-	emitCloseEvent("tcp", src, od, verdict, reason, durMs, upB, downB, closer)
+	if shouldEmitOpen(verdict, reason) {
+		emitCloseEvent("tcp", src, od, verdict, reason, durMs, upB, downB, closer)
+		return
+	}
+	// 不进事件流的流（当前唯一例外 tls_direct）：字节/时长改走聚合台账，
+	// 每分钟增量刷进 stats.tsv —— 直连面不再是黑盒，且不会撑爆 events。
+	ledgerAdd(durMs, upB, downB)
 }
 
 // isLocalDst 本机/私网/链路本地/未指定目的地址。正常 iot 重定向流的目的恒为公网

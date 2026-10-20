@@ -45,13 +45,6 @@
       "version": "5"
     },
     {
-      "type": "socks",
-      "tag": "proxy-direct",
-      "server": "127.0.0.1",
-      "server_port": 18082,
-      "version": "5"
-    },
-    {
       "type": "vless",
       "tag": "lx",
       "server": "tunnel.example.com",
@@ -79,11 +72,38 @@
       }
     },
     {
+      "type": "vless",
+      "tag": "lx2",
+      "server": "tunnel.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "flow": "xtls-rprx-vision",
+      "multiplex": {
+        "enabled": false
+      },
+      "domain_resolver": {
+        "server": "ali",
+        "strategy": "ipv4_only"
+      },
+      "tls": {
+        "enabled": true,
+        "server_name": "tunnel.example.com",
+        "alpn": [
+          "h2",
+          "http/1.1"
+        ],
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
       "type": "urltest",
       "tag": "proxy",
       "outbounds": [
-        "proxy-direct",
-        "lx"
+        "lx",
+        "lx2"
       ],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "15s",
@@ -98,13 +118,6 @@
     "auto_detect_interface": true,
     "final": "direct",
     "rules": [
-      {
-        "action": "sniff",
-        "inbound": [
-          "socks"
-        ],
-        "timeout": "300ms"
-      },
       {
         "action": "route",
         "inbound": [

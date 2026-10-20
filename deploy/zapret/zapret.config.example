@@ -1,5 +1,10 @@
 config main 'main'
 	# nfqws 启动参数（示例档位，按需调优；须与 zapret.nft 的 qnum/fwmark 一致）。
-	# 语义：80 端口伪造分片+切分（按方法切分，md5 签名伪装）；
-	# 443 端口伪造乱序（中段切分，坏序列伪装）+ 小 TTL 探针。
-	option nfqws_opt '--qnum=200 --dpi-desync-fwmark=0x40000000 --filter-tcp=80 --dpi-desync=fake,multisplit --dpi-desync-split-pos=2 --dpi-desync-fooling=md5sig --new --filter-tcp=443 --dpi-desync=fake,multidisorder --dpi-desync-split-pos=1 --dpi-desync-fooling=badseq --dpi-desync-autottl=2:4-10'
+	# 三段（--new 分隔），端口/协议维度在这一层落地，而不是在 nft 里：
+	#   80 档：HTTP 请求按方法行切分（method+2），md5 签名伪装；
+	#   443 档：TLS 中段切分（midsld）+ 坏序列伪装 + autottl；
+	#   兜底档：跑在非 443 端口上的 TLS —— 用 --filter-l7=tls 按协议识别（不是按端口猜），
+	#           同样 fake + 中段切分 + autottl；--dpi-desync-ttl=3 只是 autottl 失效时的兜底值。
+	# autottl 不能丢：它按对端实际跳数收敛 fake 包的 TTL，fake 包才能"到得了 DPI、
+	# 到不了服务端"；换成固定 TTL 就是脱敏回退（要么 DPI 收不到、要么服务端回 RST）。
+	option nfqws_opt '--qnum=200 --dpi-desync-fwmark=0x40000000 --filter-tcp=80 --dpi-desync=fake,multisplit --dpi-desync-split-pos=method+2 --dpi-desync-fooling=md5sig --new --filter-tcp=443 --dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,midsld --dpi-desync-fooling=badseq --dpi-desync-autottl=1:3-20 --new --filter-tcp=* --filter-l7=tls --dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,midsld --dpi-desync-fooling=badseq --dpi-desync-ttl=3 --dpi-desync-autottl=1:3-20'

@@ -1,5 +1,5 @@
 #!/bin/sh /etc/rc.common
-# zapret：独立 desync（NFQUEUE，TCP 80/443），脱离下游代理的 UA/指纹链。
+# zapret：独立 desync（NFQUEUE，出口全 TCP，端口白名单在 nfqws 侧），脱离下游代理的 UA/指纹链。
 # 二进制优先 /usr/bin/nfqws（overlay 常驻，重启自恢复），回退 /tmp/nfqws。
 # 策略唯一来源 /etc/config/zapret（option nfqws_opt）；改参数只改 config。
 # nft 表由 /etc/zapret.nft 恢复。注意：表文件不可放 /etc/nftables.d/ ——
@@ -10,7 +10,7 @@ START=98
 STOP=11
 
 # 隧道端点域名（启动时解析 A 记录补刷 nozapret 集；按你的环境替换）。
-# 另建议 cron 每天补刷一次（示例见 deploy/zapret/README.md）。
+# 另建议 cron 每小时补刷一次（示例见 deploy/zapret/README.md）。
 ZAPRET_DOMAINS="tunnel1.example.com tunnel2.example.com"
 
 start_service() {

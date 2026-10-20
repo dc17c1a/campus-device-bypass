@@ -12,7 +12,7 @@
   默认 `127.0.0.1:10811`）；失败一律 fail-closed（`gate_pass_fail`/
   `gate_proxy_fail`，不回退、不改拨第二腿）。
   旧政策（DoH 封堵、私有协议指纹、关键词、BSF、`http_plain`/`port80`、
-  443/段内兜底、代理记忆、逃生文件、SNI 解析）已删；第三腿（历史 xray `10808` 腿）
+  443/段内兜底、代理记忆、逃生文件、SNI 解析）已删；第三腿（历史形态，`10808`）
   gate 永不再拨。
   `:80` 仍用 `WD_PEEK80_MS`（默认 80ms）短读。
 - 日志：`gate.log` 每行含 `proto`（`tcp`/`udp`）；`verdict=err` 行另含
@@ -58,6 +58,10 @@ GOOS=linux GOARCH=arm64 go build -o wxdet-gate .
   为纯函数，统计副作用留在 `classify` 包装层。
 
 观测：`tail gate.log`（assoc/`verdict=`），`tail -3 stats.tsv`。
+直连面（`pass`/`tls_direct`）不进事件流（体量最大），改走**聚合台账**：字节/时长
+累计后每分钟增量刷进 `stats.tsv`，键为 `gate_tlsdirect_close`/`gate_tlsdirect_up_B`/
+`gate_tlsdirect_down_B`/`gate_tlsdirect_dur_ms`（无流量时一行都不写；进程被杀最坏
+丢一分钟增量）。
 名单 30s 热加载（`dl-domains`/`dl-ua`/`dl-ext`/`dl-query`，见 `lists/*.example`；
 Range 只判有无，强弱只做计数不改判路）。
 

@@ -86,7 +86,7 @@ func TestIsLocalDst(t *testing.T) {
 	}
 }
 
-// P0-1 集成（修复前会失败：直连监听口会被判 xray/default 并拨上游，链式自环）：
+// P0-1 集成（修复前会失败：直连监听口会被判 proxy/default 并拨上游，链式自环）：
 // 本机监听 + 直连（无 DNAT，origdst=本机:port）→ 必须 drop：不拨上游、无二次连接、
 // stats 计 gate_tcp_local_drop、gate.log 留一行。
 func TestHandleConnLocalDstDrop(t *testing.T) {
@@ -128,7 +128,7 @@ func TestHandleConnLocalDstDrop(t *testing.T) {
 	pln.Close()
 
 	// 假上游 socks：只数连接。P0-1 生效时应为 0（修复前会拨进来）。
-	// Task 3 起 xray 腿已删，借 proxy 腿地址占位计数（本地目的本就 drop 在 openUpstream 之前，任一腿均可）。
+	// 第三腿（历史形态）已删，借代理腿地址占位计数（本地目的本就 drop 在 openUpstream 之前，任一腿均可）。
 	fake := listenTestTCP(t, 45690)
 	defer fake.Close()
 	var dialed atomic.Int64

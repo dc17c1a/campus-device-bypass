@@ -85,10 +85,10 @@ func TestEventsOpenFilterTLS(t *testing.T) {
 	if mu["proto"] != "udp" || mu["verdict"] != "proxy" || mu["reason"] != "stun_udp" {
 		t.Fatalf("udp open fields: %v", mu)
 	}
-	// 过滤只看 reason：verdict 不参与——标准 TLS 直通的 direct/tls_direct 与历史
-	// xray/tls_direct 一律不进流；443/8000-10000 兜底的 proxy/default 照常进流。
+	// 过滤只看 reason：verdict 不参与——标准 TLS 直通的 pass/tls_direct 与换成
+	// 任意其它 verdict 的 tls_direct 一律不进流；443/8000-10000 兜底的 proxy/default 照常进流。
 	emitOpen("tcp", src, odTLS, "pass", "tls_direct")
-	emitOpen("tcp", src, odTLS, "xray", "tls_direct")
+	emitOpen("tcp", src, odTLS, "proxy", "tls_direct")
 	if lines := readLines(t, p); len(lines) != 2 {
 		t.Fatalf("tls_direct must not emit (reason-only filter), got %d lines", len(lines))
 	}
